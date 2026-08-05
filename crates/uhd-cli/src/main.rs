@@ -68,6 +68,18 @@ enum Command {
         #[arg(long)]
         serial: Option<String>,
     },
+    /// Report every version number an attached B2xx carries, and whether this
+    /// build can use it.
+    ///
+    /// Prints the FX3 firmware compatibility number, the FPGA compatibility
+    /// major and minor, the EEPROM revision, and the compatibility verdict with
+    /// the fix it recommends. Read-only unless `--auto-flash` is given.
+    ///
+    /// This is the tool to reach for when `ruhd find` reports nothing and
+    /// `ruhd probe usb` says the device is fine: it is the only command that
+    /// runs the same policy an open would, and prints the answer instead of
+    /// acting on it.
+    Doctor(DoctorArgs),
     /// Fetch and inspect the UHD images package.
     Images {
         #[command(subcommand)]
@@ -150,6 +162,27 @@ struct InitArgs {
     /// How long to wait for the device to re-enumerate, in milliseconds.
     #[arg(long, default_value_t = 3000)]
     timeout_ms: u64,
+}
+
+#[derive(Debug, Args)]
+struct DoctorArgs {
+    /// Only the device with this serial.
+    #[arg(long)]
+    serial: Option<String>,
+    /// Load a cached, in-window FPGA image into any device the verdict says
+    /// needs one.
+    ///
+    /// Without this, a fixable device is described and left alone — `doctor`
+    /// is a diagnostic first, and writing to hardware should be asked for.
+    #[arg(long)]
+    auto_flash: bool,
+    /// Exit non-zero unless every device examined is ready to open.
+    ///
+    /// For CI. The default is to report and exit zero, because a report that
+    /// fails the shell is a poor way to describe three devices of which one is
+    /// unhappy.
+    #[arg(long)]
+    strict: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -256,6 +289,7 @@ fn run(command: &Command) -> Result<()> {
             None => probe_usb(usb),
         },
         Command::Init(args) => init(args),
+        Command::Doctor(args) => doctor(args),
         Command::Reset { serial } => reset(serial.as_deref()),
         Command::Images { action } => match action {
             ImagesAction::Status => images_status(),
@@ -627,6 +661,152 @@ fn load_fpga(iface: &usb::Fx3Iface, device: &usb::UsbProbe, args: &InitArgs) -> 
     }
     println!("           gpif reset");
     Ok(())
+}
+
+/// Prints every version number each attached B2xx carries, and the verdict.
+///
+/// The four things it exists to show — firmware compat, FPGA compat major and
+/// minor, EEPROM revision, and what this build makes of them — are the four
+/// numbers that decide whether a device opens, and `uhd_usrp_probe` prints them
+/// only for a device it has already accepted. This prints them for a device it
+/// would refuse, which is the case where they are actually needed.
+fn doctor(args: &DoctorArgs) -> Result<()> {
+    let catalog = uhd_b200::UhdImagesCatalog::builtin()?;
+
+    let mut filter = usb::UsbFilter::new();
+    filter.serial.clone_from(&args.serial);
+    let devices = usb::probe_filtered(&filter)?;
+
+    if devices.is_empty() {
+        println!("no b2xx devices found on the usb bus");
+        return Ok(());
+    }
+
+    println!(
+        "images:  {}",
+        match catalog.cache_root() {
+            Some(root) => root.display().to_string(),
+            None => "<no image cache; set UHD_IMAGES_CACHE_DIR or HOME>".to_owned(),
+        }
+    );
+    println!("window:  fpga compat major {}", supported_window());
+
+    let mut all_ready = true;
+    for (i, device) in devices.iter().enumerate() {
+        println!();
+        println!("Device {i}");
+        println!("  usb:      {}", device.endpoint);
+        println!(
+            "  serial:   {}",
+            device.serial().unwrap_or("<none — EEPROM not programmed>")
+        );
+        println!("  state:    {}", device.state);
+
+        let mut checkup = uhd_b200::checkup(device, &catalog);
+
+        // Fixing is opt-in, and only ever attempted on a verdict that says a
+        // cached image would fix it.
+        if args.auto_flash && matches!(checkup.verdict, Some(uhd_b200::Verdict::Reload(_))) {
+            match auto_flash(device, &catalog) {
+                Ok(message) => {
+                    println!("  flashed:  {message}");
+                    checkup = uhd_b200::checkup(device, &catalog);
+                }
+                Err(e) => println!("  flashed:  <failed: {e}>"),
+            }
+        }
+
+        print_checkup(&checkup);
+        all_ready &= checkup
+            .verdict
+            .as_ref()
+            .is_some_and(uhd_b200::Verdict::is_ok);
+    }
+
+    if args.strict && !all_ready {
+        return Err(Error::Firmware(
+            "not every device examined is ready to open".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// The supported window, rendered the way `doctor`'s header wants it.
+fn supported_window() -> String {
+    uhd_b200::FpgaCompat::WINDOW
+        .iter()
+        .map(|c| c.major().to_string())
+        .collect::<Vec<_>>()
+        .join(" and ")
+}
+
+/// The body of one `doctor` block: the numbers, then the verdict.
+fn print_checkup(checkup: &uhd_b200::Checkup) {
+    if let Some(report) = &checkup.report {
+        println!(
+            "  firmware: {} (expected {})",
+            report.firmware, report.expected_firmware
+        );
+        match report.fpga.version() {
+            Some(version) => println!(
+                "  fpga:     major {}, minor {} (signature {:#010x})",
+                version.major, version.minor, version.signature
+            ),
+            None => println!("  fpga:     {}", report.fpga),
+        }
+        println!(
+            "  eeprom:   revision {}, layout {}",
+            opt_u16(report.eeprom.revision),
+            match report.eeprom.layout {
+                Some(layout) => layout.to_string(),
+                None => format!("<unrecognised signature {:#010x}>", report.eeprom.signature),
+            }
+        );
+        println!("  usb:      operating over usb {}", report.usb_speed);
+    }
+
+    println!("  verdict:  {}", checkup.headline());
+    match checkup.recommended_fix() {
+        Some(fix) => println!("  fix:      {fix}"),
+        None if checkup
+            .verdict
+            .as_ref()
+            .is_some_and(uhd_b200::Verdict::is_ok) =>
+        {
+            println!("  fix:      none needed");
+        }
+        None => println!("  fix:      <none this tool can suggest>"),
+    }
+
+    // The full diagnostic, which names the window and the manifest entry, is
+    // worth its own lines rather than being folded into one.
+    if let Some(uhd_b200::Verdict::Unsupported(diagnosis)) = &checkup.verdict {
+        println!("  detail:   {diagnosis}");
+    }
+}
+
+/// Opens the device with auto-flash enabled and reports what got loaded.
+fn auto_flash(device: &usb::UsbProbe, catalog: &dyn uhd_b200::ImageCatalog) -> Result<String> {
+    let interactive = std::io::IsTerminal::is_terminal(&std::io::stdout());
+    let mut last_decile = 0;
+    let options = uhd_b200::OpenOptions::new().with_auto_flash(true);
+
+    let session = uhd_b200::open_probed(device, &options, catalog, |sent, total| {
+        let decile = sent * 10 / total;
+        if interactive && decile != last_decile {
+            last_decile = decile;
+            print!("\r  flashed:  loading {:>3}%", decile * 10);
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+        }
+    })?;
+    if interactive {
+        print!("\r");
+    }
+
+    Ok(match session.flashed() {
+        Some(flashed) => flashed.to_string(),
+        None => "nothing to load after all".to_owned(),
+    })
 }
 
 /// Resets the FX3 and waits for it to come back needing firmware.

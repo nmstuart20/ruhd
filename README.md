@@ -18,7 +18,7 @@ rationale, the reference material, and the plan.
 | `uhd-core` | The object-safe `Device` trait, streamers, and the value types they trade in. No I/O. |
 | `uhd-transport` | Link, register and serial-bus traits; USB discovery, FX3 firmware and FPGA loading, the EEPROM map and settings-bus access (`usb`); image path resolution (`images`). |
 | `chdr` | Packet framing. Empty. |
-| `ad936x` | AD9361/AD9364 transceiver driver. Empty. |
+| `ad936x` | AD9361/AD9364 transceiver driver. SPI register access, reset and identity, and the clock chain: the rate table, the BBPLL, the FIR filters and the digital interface. No tuning, gain or calibration yet. |
 | `uhd-b200` | B2xx backend, including the B205mini. Empty. |
 | `uhd-cli` | The `ruhd` binary. |
 

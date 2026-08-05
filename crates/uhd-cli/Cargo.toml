@@ -13,8 +13,9 @@ name = "ruhd"
 path = "src/main.rs"
 
 [dependencies]
+uhd-b200.workspace = true
 uhd-core.workspace = true
-uhd-images.workspace = true
+uhd-images = { workspace = true, features = ["download"] }
 uhd-transport.workspace = true
 
 clap.workspace = true

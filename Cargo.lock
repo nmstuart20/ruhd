@@ -5,6 +5,10 @@ version = 4
 [[package]]
 name = "ad936x"
 version = "0.1.0"
+dependencies = [
+ "tracing",
+ "uhd-core",
+]
 
 [[package]]
 name = "adler2"
@@ -921,10 +925,12 @@ checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 name = "uhd-b200"
 version = "0.1.0"
 dependencies = [
+ "ad936x",
  "chdr",
  "nusb",
  "tracing",
  "uhd-core",
+ "uhd-images",
  "uhd-transport",
 ]
 
@@ -937,6 +943,7 @@ dependencies = [
  "sha2",
  "tracing",
  "tracing-subscriber",
+ "uhd-b200",
  "uhd-core",
  "uhd-images",
  "uhd-transport",

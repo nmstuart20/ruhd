@@ -7,12 +7,33 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[features]
+# Tests that need a B2xx on the bench. Off by default so `cargo test
+# --workspace` on a machine with no hardware stays green; CI runs them on a
+# self-hosted runner, once per cached image version. See NOTES.md.
+hw-tests = []
+
 [dependencies]
+# The transceiver driver. The dependency is one-way and stays that way: this
+# crate implements ad936x's SpiInterface, and ad936x knows nothing about a B2xx.
+ad936x.workspace = true
 chdr.workspace = true
 nusb.workspace = true
 tracing.workspace = true
 uhd-core.workspace = true
 uhd-transport.workspace = true
+
+# The compat policy reads the image manifest and the image cache to decide
+# whether a mismatch is fixable. `default-features = false` drops `download`,
+# which is what keeps ureq and zip out of a crate that talks to hardware —
+# fetching images is `ruhd images sync`'s job, not a driver's.
+uhd-images = { workspace = true, default-features = false }
+
+[[example]]
+name = "scratch_gate"
+
+[[example]]
+name = "codec_id"
 
 [lints]
 workspace = true

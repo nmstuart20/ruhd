@@ -72,10 +72,11 @@ uhd-b200        B2xx backend; the only crate that knows about USB and the FX3
 uhd-cli         the `ruhd` binary
 ```
 
-The dependency direction is the point. `ad936x` depends on `uhd-transport`'s
-`SpiIface`, **not** on `uhd-b200`, so the transceiver driver is reusable on any
-board carrying the part. `chdr` depends on nothing, so packet framing can be
-tested against captured bytes with no device present.
+The dependency direction is the point. `ad936x` depends on **nothing but
+`uhd-core`** — it defines the SPI trait it needs and `uhd-b200` implements it —
+so the transceiver driver is reusable on any board carrying the part. `chdr`
+depends on nothing, so packet framing can be tested against captured bytes with
+no device present.
 
 ## Design decisions
 
@@ -192,8 +193,15 @@ justified.
 - **Overflows are not exceptions.** An overflow arrives in `RxMetadata` and
   `RxMetadata::check()` deliberately treats it as non-fatal, because absorbing
   overflows is exactly what a receive loop is supposed to do.
-- **Compatibility numbers are reported, not enforced.** See the section below;
-  this is the largest deliberate divergence so far.
+- **Compatibility numbers are reported by the transport and judged by the
+  backend.** See the section below; this is the largest deliberate divergence so
+  far.
+- **A mismatch offers a fix rather than only naming one.** `check_fpga_compat`
+  throws and tells you to run `uhd_images_downloader.py`. `uhd_b200::policy`
+  looks in the image cache first, and if a verified image would put the device
+  in window it says so — and loads it with `--auto-flash`. That is only
+  reasonable because a B2xx's FPGA is volatile anyway; it would be a bad idea on
+  a device with configuration flash.
 - **The FPGA loader is version-agnostic.** `usb::fpga` pushes the bytes it is
   given and reports what the device says afterwards. It never reads a version
   out of the bitstream and never compares one. `b200_impl.cpp` interleaves the
@@ -281,15 +289,91 @@ rough order of how much they matter:
   application should refuse; a bring-up tool should warn; a recovery tool should
   proceed regardless. One hard-coded answer cannot serve all three.
 
-The accept/reject decision, and what to do about a rejection — compat
-negotiation, including fetching or loading a matching image — is a layer that
-will sit on top of `CompatReport`. It does not exist yet, which is why nothing
-currently refuses anything.
+The accept/reject decision, and what to do about a rejection, is
+`uhd_b200::policy` — see the next section. The split is the point: the transport
+gathers, the backend judges, and `ruhd probe --full` can still describe a device
+`uhd_b200::open` would refuse.
 
 The one place the old behaviour survives is `Fx3Iface::check_firmware_version`,
 used by `initialize`: pushing an FPGA bitstream through firmware whose protocol
 this driver does not know is not a diagnosis, it is a way to hang. Reading the
 number is `firmware_version`, and it is what `CompatReport` uses.
+
+## FPGA compat negotiation, and the commitment it creates
+
+`uhd_b200::compat` defines a `FpgaCompat` enum with **one variant per supported
+compatibility major**, and a `FpgaShim` behind each:
+
+| Variant | Major | UHD constant | FPGA builds |
+| --- | ---: | --- | --- |
+| `V7` | 7 | `B205_FPGA_COMPAT_NUM` | the B2xxmini images |
+| `V16` | 16 | `B200_FPGA_COMPAT_NUM` | `usrp_b200_fpga.bin`, `usrp_b210_fpga.bin` |
+
+The major is read *before any other configuration* — `session::open_probed`'s
+first two operations are the firmware compat read and the FPGA compat read — and
+resolved once into a shim that everything below it consults. This is deliberately
+not how `b200_impl.cpp` does it: there, a dozen `is_b2xx_mini(_product)` tests
+are scattered from the constructor through `update_clock_source`,
+`update_time_source` and `update_bandsel`, and adding a third FPGA generation
+means auditing the file. Here the difference between generations is a table:
+GPSDO presence, band-select GPIO, the reference-lock mechanism, the clock and
+time source lists, the radio-chain ceiling, the stream IDs, and
+`SR_CORE_GPSDO_ST`'s existence.
+
+The policy layer over that is `uhd_b200::policy::negotiate`, a pure function of
+a `DeviceCompat` and an `ImageCatalog`:
+
+1. **In window** — the reported major has a shim and is legal for this board:
+   proceed on that shim.
+2. **Out of window, fixable** — a verified image in the `uhd-images` cache would
+   put it in window: offer the reload, or perform it with `--auto-flash` through
+   `usb::configure`, then read and negotiate again. The device's own answer after
+   the load is what decides, not the loader's claim.
+3. **Neither** — refuse, with a diagnostic naming the device's compatibility
+   number, the supported window, and the manifest entry that would fix it.
+
+A firmware major mismatch is checked first and is never case 2: an FPGA reload
+cannot fix firmware, and pushing a bitstream through firmware whose protocol is
+unknown is how a device hangs. An *unreadable* compat register is not case 2
+either — the usual cause is another process holding the bulk interfaces, and
+reflashing a working FPGA is the wrong answer to that.
+
+`ruhd doctor` prints the four numbers the decision rests on — firmware compat,
+FPGA compat major and minor, EEPROM revision — plus the verdict and the fix. It
+is the only command that runs the policy without acting on it, which is exactly
+what you want from a device that will not open.
+
+### The commitment
+
+Every variant of `FpgaCompat` is a promise, and it is worth being explicit about
+the terms before the enum grows a third one:
+
+- **Each supported major keeps its shim alive.** `V7` and `V16` both have a
+  complete `FpgaShim`. A behavioural difference discovered later has to be added
+  to *both*, not guarded with a version test at the call site — the whole value
+  of the enum is that call sites do not branch.
+- **Each supported major stays CI-tested.** `compat::tests` and `policy::tests`
+  run on every push and cover both shims and the full policy matrix. The
+  `hw-tests` feature adds a hardware matrix that runs once per cached image
+  version — currently the two different `usrp_b205mini_fpga.bin` builds in
+  `crates/uhd-images/images.toml`, which have different bytes, sizes and hashes —
+  and asserts the FX3 ends up holding the hash of the image that leg cached. Two
+  legs against two versions is what makes it a test of *negotiation* rather than
+  a test that the driver works. Both legs were run against the bench B205mini:
+  v4.6.0.0 loads 4 222 976 bytes, v4.10.0.0 loads 4 223 252, both land on major
+  7, and each leg's cache holds only its own image so the choice is forced.
+- **Dropping a major from the window is a breaking change for `uhd-b200`.**
+  Hardware in the field does not update itself, and removing `V16` would turn
+  every B200 and B210 from "supported" into "refused with a diagnostic". It is a
+  semver-major change, and it needs the same deliberation as removing a public
+  method — not a cleanup.
+- **The manifest and the window have to agree.** An image the manifest offers
+  whose compat major has no shim is a `ruhd images sync` that installs something
+  we would then refuse. `policy::tests::the_shipped_manifest_covers_the_b205mini_in_window`
+  is the assertion that keeps them in step.
+
+The cost this buys is small and known: two zero-sized shims and a table each.
+The cost it avoids is the one `b200_impl.cpp` is paying.
 
 ## Reaching the FPGA is not the same as reaching the FX3
 
@@ -314,10 +398,98 @@ Three consequences that cost time to rediscover:
   half with `(addr / 4) & 1`; `LocalCtrl` overrides `RegisterIface::peek64` for
   the same reason, since the default's two round trips could straddle a change.
 
+A fourth, learned the hard way while building the hardware matrix: **the local
+core answers as soon as the FPGA is configured, the radio cores do not.** The
+radio chains run off the AD936x's clock, so until the codec is both clocking and
+out of its wait state nothing at `SR_TEST`/`RB32_TEST` replies and the symptom is
+again the full two-second ack timeout. Everything compat negotiation needs — the
+compatibility register at address 0, the radio-chain count in `RB32_CORE_STATUS`
+— is on the local core, which is why the hardware matrix can run today and
+`RadioCtrl::gate` is behind `RUHD_HW_RADIO_CLOCKED` until then.
+
 `usb::ctrl` is deliberately the minimum: one packet, one reply, under a mutex.
 It carries no timestamps, queues nothing, and does not demultiplex the GPSDO
 UART out of the same endpoint. When the real radio control core lands it should
 replace this rather than wrap it.
+
+## The bootstrap order is forced by where the SPI master sits
+
+The local/radio split above is not just a fact about latency, it is the shape of
+bring-up. The radio cores run off the AD936x's sample clock; the AD936x is
+started over SPI; and `SR_CORE_SPI` is therefore a **local**-core register. That
+circle only opens one way:
+
+```text
+  fpga configured
+    -> local core answers
+      -> SR_CORE_MISC : release the codec's reset pin
+      -> SR_CORE_SPI  : spi_core_3000 at 1 MHz
+        -> AD936x register 0x037 reads back 0x08 | revision
+          -> Ad936x::initialize_clocking : the BBPLL locks
+            -> (not yet) the ENSM leaves its wait state
+              -> radio cores answer: ATR, time, dsp, scratch
+```
+
+`uhd_b200::spi` and `uhd_b200::misc` are the two local-core peripherals, and
+`B200Session::codec_gate` is the arrow in the middle. `uhd_b200::atr` and
+`uhd_b200::time_core` are on the far side. The BBPLL is now running, but whether
+the part drives its data port before the ENSM has been walked into ALERT is not
+something this workspace has confirmed on a board — so `hw_compat.rs`'s scratch
+gate stays behind `RUHD_HW_RADIO_CLOCKED` until the ENSM transitions land and a
+B205mini says otherwise.
+
+`RadioCtrl` therefore hands out `CtrlPort`s rather than owning a route: one
+transport, a stream ID per port, and the queue of outstanding commands records
+which response stream ID each one is owed a reply from. `b200_impl` gets the
+same effect by constructing a separate `radio_ctrl_core` per SID over a shared
+transport; the difference is only that a port here is a cheap clone rather than
+an object with a task attached.
+
+## The SPI boundary is drawn at the part, not at the bus
+
+`ad936x` defines its own `SpiInterface` — one transaction, MSB first, no slave
+select, no clock edges — and `uhd-b200` implements it. `uhd_transport::SpiIface`
+still exists and is still what `spi_core_3000` implements, but `ad936x` does not
+use it and does not depend on `uhd-transport` at all.
+
+This is a divergence from both UHD and from the plan recorded earlier in this
+file, and the reason is visible in one line of `ad9361_ctrl.cpp`:
+
+```cpp
+config.miso_edge = uhd::spi_config_t::EDGE_FALL; // TODO (Ashish): FPGA SPI
+                                                 // workaround. This should be EDGE_RISE
+```
+
+That is a workaround for a *Xilinx SPI core*, sitting inside the transceiver
+driver, applied to every board that will ever carry an AD936x. It is there
+because `ad9361_io_spi` holds a general-purpose `spi_iface` and therefore has to
+build a `spi_config_t`, and once a driver is building bus configuration it will
+inevitably encode something about the bus. Narrowing the trait removes the
+opportunity: with no `spi_config_t` to fill in, `ad936x` cannot express a
+board-specific workaround even by accident, and `uhd_b200::spi::CODEC_SPI_CONFIG`
+is the single place the edge is chosen.
+
+What each side owns, concretely:
+
+| Fact | Owner |
+| --- | --- |
+| 24-bit word, R/W bit at 23, address at 8, data at 0 | `ad936x::spi` |
+| register 0x037 means product ID | `ad936x::regs` |
+| a 40 MHz reference feeds the BBPLL | `ad936x::clocking` |
+| the codec is slave 0, clocked at 1 MHz | `uhd_b200::spi` |
+| MISO is sampled on the falling edge | `uhd_b200::spi` |
+| the reset pin is bit 2 of `SR_CORE_MISC` | `uhd_b200::misc` |
+| the data port is CMOS, delays 0/0xF | `uhd_b200::codec` |
+| a mini stays on RF port A, a B210 switches | `uhd_b200::codec` |
+
+The last two are the second half of that boundary. UHD makes them a virtual
+interface — `ad9361_params`, with `b200_ad9361_client_t` and
+`b2xxmini_ad9361_client_t` implementing four getters that return constants — and
+here they are a `ClientParams` struct handed over at construction. Both
+implementations of those getters return compile-time constants, and there is
+nowhere in the driver that calls one at a moment when the answer could have
+changed; making them data means the settings are printable, comparable and
+testable, and that a callback from inside the codec's own lock cannot exist.
 
 ## The FPGA image hash is UHD's, on purpose
 
@@ -369,6 +541,53 @@ hardware path is `uhd_transport::usb`, which now takes a device all the way from
 - image path resolution and a downloader for the B2xx images package
   (`ruhd images status` / `download`).
 
+`uhd-b200` has the compat negotiation layer over that: `compat` (the
+`FpgaCompat` enum and its shims), `policy` (the accept / reload / refuse
+decision), `session` (the open path and the read-only `checkup`), and
+`radio_ctrl` promoted to open against a negotiated major. `ruhd doctor` is the
+CLI front end. It is not yet a `Device` impl — `ruhd find` still finds nothing.
+
+On top of that sit the settings-bus peripherals, one module each:
+
+| Module | Ports | Core |
+| --- | --- | --- |
+| `spi` | `spi_core_3000.cpp`, `b200_local_spi_core` | local |
+| `misc` | `update_gpio_state`, `reset_codec`, `get_ref_locked` | local |
+| `atr` | `gpio_atr_3000.cpp`, `update_atrs` | radio |
+| `time_core` | `time_core_3000.cpp`, `update_time_source`, `set_time` | radio |
+
+`ad936x` has the bus, the identity check and the clock chain: the 24-bit command
+framing, the register file, the soft reset and the product-ID read that
+`ad9361_device_t::initialize` opens with, and then the first half of that
+sequence — the reference clock path, `_setup_rates` in full (the rate table, the
+BBPLL divide word, the DAC divider and both FIR filters), the data port and the
+interface delays. The arithmetic is split out into `ad936x::clocking` as pure
+functions, so the numbers can be checked against the C++ without a board.
+
+Nothing above that yet: no RF tuning, gain tables, analog filter calibration,
+DC-offset or quadrature calibration, and no public `set_clock_rate` — the
+reference's wraps `_setup_rates` in ENSM transitions and seven re-calibrations,
+and shipping the wrapper without them would give a part that clocks at the new
+rate and receives badly.
+
+Verified against the bench B205mini (serial `3168B41`, FPGA compat 7.0), on a
+device whose codec no other process had touched.
+`cargo run -p uhd-b200 --example codec_id` releases the reset pin through
+`SR_CORE_MISC`, soft-resets the part over SPI at 1 MHz, and reads `0x0a` back
+from register `0x037` — family `0x08` as `initialize` requires, silicon revision
+2. The four SPI-level tests in `hw_codec.rs` pass on the same board: the gate,
+ten repeated product-ID reads with no variation, a write/read loopback over
+`0x03d` across `0x00`/`0x55`/`0xaa`/`0xff`, and the reset-line check.
+
+The two clock-chain tests in that file — `the_clock_chain_comes_up_and_the_bbpll_locks`
+and `the_chain_re_solves_for_every_rate_the_board_is_asked_for` — arrived with
+the clocking port and **have not been run against a board yet**. They are the
+next thing to try on the bench, and the lock bit is the finding to record here.
+
+That is the first evidence in this workspace that anything past the FPGA
+exists — every earlier hardware result was the FX3 or the FPGA describing
+itself.
+
 Verified against a B205mini, from a bootloader-state device:
 
 - `ruhd init` loads firmware 8.0, reads the EEPROM (rev 0 layout, serial
@@ -384,8 +603,8 @@ Verified against a B205mini, from a bootloader-state device:
   `ruhd init` reports the FPGA already current and skips it, because the image
   hashes agree.
 
-`chdr`, `ad936x` and `uhd-b200` are still empty; `ruhd find` still finds nothing
-because no backend registers itself yet, and no samples move.
+`ruhd find` still finds nothing because no backend registers itself yet, and no
+samples move.
 
 `nusb` rather than `rusb`/`libusb`: it is pure Rust, so the build has no C
 dependency, and its enumeration reads sysfs without opening anything, which is
@@ -394,18 +613,27 @@ distinction is load-bearing for the udev diagnostics in `ruhd probe usb`.
 
 Rough order of work from here:
 
-1. **Compat negotiation** — the policy layer over `CompatReport` that decides
-   what a mismatch means and what to do about it. `CompatReport` exists to be
-   its input; nothing refuses anything until it lands.
-2. `uhd-b200` — a real `Device` impl over the pieces that now exist: the EEPROM
-   read for identity, `usb::ctrl` promoted to a proper radio control core, and
-   the SPI/I2C interfaces the AD936x needs. Enough for `ruhd find` to print a
-   real B205mini.
-3. `ad936x` — SPI register access, then initialisation and tuning.
-4. `chdr` — packet framing.
-5. `uhd-b200` streamers — first samples.
+1. ~~**Compat negotiation**~~ — done; see the section above.
+2. ~~**The settings-bus peripherals**~~ — done: `spi`, `misc`, `atr`,
+   `time_core`, and `ad936x`'s SPI register access. The codec product-ID gate is
+   the proof.
+3. `ad936x` — the initialisation sequence. The clock half is done: BBPLL, the
+   clock tree, the rate table, the FIRs and the digital interface. What remains
+   is the ENSM transitions, RF tuning, the gain and mixer tables, the analog
+   filter calibrations, the DC-offset and quadrature calibrations, and the
+   public `set_clock_rate` that needs them. `ad9361_device.cpp` is 3011 lines
+   and most of them are still here.
+4. `uhd-b200` — a real `Device` impl over all of it: the EEPROM read for
+   identity, tick rate, tuning, gain. Enough for `ruhd find` to print a real
+   B205mini.
+5. `chdr` — packet framing.
+6. `uhd-b200` streamers — first samples.
 
-When step 2 lands, `register_backends()` in `crates/uhd-cli/src/main.rs` becomes
+Step 3 is the one that unblocks the rest: the scratch gate in `hw_compat.rs` and
+the two radio-core modules all become runnable the moment the codec is clocking,
+and `RUHD_HW_RADIO_CLOCKED` can go away with them.
+
+When step 4 lands, `register_backends()` in `crates/uhd-cli/src/main.rs` becomes
 `uhd_b200::register()` and the CLI needs no other change.
 
 [nusb]: https://docs.rs/nusb

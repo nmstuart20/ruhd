@@ -20,8 +20,10 @@
 //!   fixed-size frames from a pool, so one pair of traits covers both.
 //! - [`register`] is peek/poke against the settings bus, whether that is an FX3
 //!   control transfer or a ZPU packet.
-//! - [`serial`] is SPI/I2C/GPIO, kept here rather than in a backend so the
-//!   AD9361 driver can depend on the bus rather than on the board.
+//! - [`serial`] is SPI/I2C/GPIO in their general forms, kept here rather than in
+//!   a backend so a caller can reach a bus without naming the board behind it. A
+//!   driver for a specific part defines its own narrower trait — see the module
+//!   docs.
 
 pub mod endpoint;
 pub mod images;

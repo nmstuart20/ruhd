@@ -34,6 +34,17 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+      # The compat policy matrix is the thing most likely to be quietly broken
+      # by a manifest edit, and it needs no hardware, so it is called out
+      # rather than left to be one line of the run above.
+      - name: Compat policy matrix
+        run: cargo test -p uhd-b200 --lib -- compat:: policy:: --nocapture
+
+      # The hardware tests must keep compiling on a machine with no B2xx, or
+      # they rot between the rare runs of the job below.
+      - name: Hardware tests compile
+        run: cargo clippy -p uhd-b200 --features hw-tests --all-targets -- -D warnings
+
       - name: Docs
         run: cargo doc --workspace --no-deps
         env:
@@ -54,3 +65,67 @@ jobs:
 
       - name: Build
         run: cargo build --workspace
+
+  # One leg per cached image version. The point is not that the driver works —
+  # the leg above proves that — but that compat negotiation lands the *right*
+  # image in the device, which cannot be shown without at least two different
+  # images to choose between. Each leg gets its own cache holding exactly one
+  # FPGA image, and the test asserts the FX3 ends up holding that one's hash.
+  #
+  # Needs a self-hosted runner labelled `b205mini` with a board attached, the
+  # udev rules installed, and no other process holding the device. Skipped
+  # everywhere else, including forks.
+  hw-matrix:
+    name: hardware — fpga compat ${{ matrix.release }}
+    runs-on: [self-hosted, b205mini]
+    if: github.repository == 'nmstuart20/ruhd'
+    strategy:
+      # One board, one leg at a time.
+      max-parallel: 1
+      # A failure on one release is worth knowing about independently of the
+      # other, so the matrix runs to completion.
+      fail-fast: false
+      matrix:
+        # Two different `usrp_b205mini_fpga.bin` builds, both fpga compat
+        # major 7 — different bytes, different sizes, different SHA-256. See
+        # crates/uhd-images/images.toml.
+        release: [v4.6.0.0, v4.10.0.0]
+    env:
+      # A cache per leg, so each leg has exactly one FPGA image to pick from.
+      UHD_IMAGES_CACHE_DIR: ${{ runner.temp }}/uhd-images-${{ matrix.release }}
+      UHD_IMAGES_LOCKFILE: ${{ runner.temp }}/uhd-images-${{ matrix.release }}.lock
+      RUHD_HW_RELEASE: ${{ matrix.release }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Fetch this leg's images
+        run: |
+          cargo run --bin ruhd -- images sync \
+            --device b205mini --release "${{ matrix.release }}"
+          cargo run --bin ruhd -- images verify \
+            --device b205mini --release "${{ matrix.release }}"
+
+      # Firmware up, FPGA deliberately left unconfigured: that is the
+      # out-of-window state the policy layer has to resolve, and starting from
+      # it is what makes the reload path the one under test.
+      - name: Put the board in a needs-fpga state
+        run: |
+          cargo run --bin ruhd -- reset || true
+          cargo run --bin ruhd -- init --no-fpga
+
+      - name: Doctor reports the mismatch before the reload
+        run: cargo run --bin ruhd -- doctor
+
+      # Runs both hardware test files: hw_compat.rs, which is the negotiation
+      # matrix this leg exists for, and hw_codec.rs, which reaches the AD936x
+      # over SPI. Both stay on the FPGA's local core, so neither needs the
+      # codec to have been initialised by anything else.
+      - name: Negotiate, reload, verify, and reach the codec
+        run: cargo test -p uhd-b200 --features hw-tests -- --test-threads 1 --nocapture
+
+      - name: Doctor reports a supported device afterwards
+        run: cargo run --bin ruhd -- doctor --strict

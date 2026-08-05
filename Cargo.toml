@@ -16,7 +16,9 @@ ad936x = { path = "crates/ad936x", version = "0.1.0" }
 chdr = { path = "crates/chdr", version = "0.1.0" }
 uhd-b200 = { path = "crates/uhd-b200", version = "0.1.0" }
 uhd-core = { path = "crates/uhd-core", version = "0.1.0" }
-uhd-images = { path = "crates/uhd-images", version = "0.1.0" }
+# `download` off here so a driver crate can depend on the manifest and the
+# cache without dragging in a TLS stack; `uhd-cli` opts back in.
+uhd-images = { path = "crates/uhd-images", version = "0.1.0", default-features = false }
 uhd-transport = { path = "crates/uhd-transport", version = "0.1.0" }
 
 # External crates. Pinned here so every crate in the workspace agrees.

@@ -8,6 +8,16 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+# The error type and the log macros, and nothing else. In particular *not*
+# uhd-transport: this crate defines the SPI trait it needs rather than borrowing
+# a general-purpose one, so the transceiver driver has no opinion about how the
+# board is wired. See the `spi` module docs.
+#
+# `tracing` earns its place because the clock chain is arithmetic whose inputs
+# and outputs are the first thing anyone asks for when a rate comes out wrong,
+# and the reference logs the same values at the same points.
+tracing.workspace = true
+uhd-core.workspace = true
 
 [lints]
 workspace = true

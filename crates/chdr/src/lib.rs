@@ -23,16 +23,22 @@ pub enum LinkType {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[repr(u8)]
 pub enum PacketType {
+    /// Sample data.
     #[default]
     Data = 0,
+    /// An IF-extension packet, which nothing in the B2xx path emits.
     IfExtension = 1,
+    /// Context: the flow-control and settings-bus packets B2xx control uses.
     Context = 2,
 }
 
 /// Byte order of words on the link.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Endian {
+    /// Network byte order, which is what a UDP-attached USRP uses.
     Big,
+    /// Host byte order on every platform this driver targets, and what the
+    /// B2xx's USB path uses.
     #[default]
     Little,
 }
@@ -41,14 +47,23 @@ pub enum Endian {
 /// [`pack`] and returned separately by [`unpack`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IfPacketInfo {
+    /// Which link header wraps the VRT header.
     pub link_type: LinkType,
+    /// VRT packet type.
     pub packet_type: PacketType,
+    /// Sequence number: 12 bits on CHDR, four on VRT.
     pub packet_count: u16,
+    /// Start of burst.
     pub sob: bool,
+    /// End of burst.
     pub eob: bool,
+    /// Stream ID. Always present on CHDR.
     pub sid: Option<u32>,
+    /// Class ID.
     pub cid: Option<u64>,
+    /// Integer-seconds timestamp.
     pub tsi: Option<u32>,
+    /// Fractional-seconds timestamp, in ticks.
     pub tsf: Option<u64>,
     /// Request/preserve a VRT trailer. The occupancy and burst indicator bits
     /// are normalized by the packer, as in UHD.
@@ -79,9 +94,13 @@ impl Default for IfPacketInfo {
 /// A decoded interface packet.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IfPacket {
+    /// The decoded header.
     pub info: IfPacketInfo,
+    /// Payload words, in host order.
     pub payload: Vec<u32>,
+    /// How many words the header occupied.
     pub header_words: usize,
+    /// How many words the whole packet occupied, header and trailer included.
     pub packet_words: usize,
 }
 

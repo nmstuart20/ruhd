@@ -15,9 +15,41 @@ build-release:
 test:
     cargo test --workspace
 
+# Just the compat negotiation tests: the shims and the policy matrix.
+test-compat:
+    cargo test -p uhd-b200 --lib -- compat:: policy:: --nocapture
+
+# The codec bring-up gate: reach the AD936x over SPI and read its product ID.
+# Needs a board with firmware and an FPGA image loaded (`just cli init`), but
+# not an initialised codec — see crates/uhd-b200/examples/codec_id.rs.
+#
+#   just codec-id [SERIAL]
+codec-id *ARGS:
+    cargo run -p uhd-b200 --example codec_id -- {{ARGS}}
+
+# Run the hardware compat tests against an attached B205mini, for one UHD
+# release. Needs a board; see crates/uhd-b200/tests/hw_compat.rs.
+#
+#   just hw-test v4.10.0.0
+hw-test RELEASE:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cache=$(mktemp -d)
+    export UHD_IMAGES_CACHE_DIR="$cache"
+    export UHD_IMAGES_LOCKFILE="$cache/uhd-images.lock"
+    export RUHD_HW_RELEASE="{{RELEASE}}"
+    cargo run --bin ruhd -- images sync --device b205mini --release "{{RELEASE}}"
+    cargo run --bin ruhd -- reset || true
+    cargo run --bin ruhd -- init --no-fpga
+    cargo test -p uhd-b200 --features hw-tests -- --test-threads 1 --nocapture
+
+# Both legs of the hardware matrix CI runs, back to back.
+hw-matrix: (hw-test "v4.6.0.0") (hw-test "v4.10.0.0")
+
 # Lint. Warnings are errors, same as CI.
 clippy:
     cargo clippy --workspace --all-targets -- -D warnings
+    cargo clippy -p uhd-b200 --features hw-tests --all-targets -- -D warnings
 
 # Rewrite source to rustfmt's liking.
 fmt:

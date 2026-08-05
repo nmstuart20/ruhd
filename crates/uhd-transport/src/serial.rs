@@ -1,10 +1,23 @@
 //! Serial buses hanging off the device: SPI, I2C, GPIO.
 //!
-//! These live here rather than in a backend crate for a specific reason: the
-//! AD9361 driver in `ad936x` needs to talk SPI, and the only thing it should
-//! need to know is *that it is SPI*. Putting [`SpiIface`] here lets `ad936x`
-//! depend on this crate instead of on `uhd-b200`, so the same transceiver
-//! driver serves the B205mini today and an E310 later without edits.
+//! These are the *general* forms — a SPI master with a slave select and clock
+//! edges, an I2C master, a bank of pins — and they live here so that a backend
+//! can offer them without a caller having to name the backend. `uhd-b200`'s
+//! `spi_core_3000` port implements [`SpiIface`]; a `ruhd` command that wants to
+//! poke a daughterboard EEPROM asks for [`I2cIface`].
+//!
+//! # What a device driver should ask for instead
+//!
+//! A driver for a *part* — the AD936x, a clock chip — should define the narrow
+//! trait it actually needs in its own crate rather than taking one of these.
+//! `ad936x::SpiInterface` is one transaction with no slave select and no edges,
+//! because slave selects and edges are facts about the board and the part driver
+//! has no business knowing them. `uhd-b200` implements both traits and is the
+//! only place the two meet.
+//!
+//! The distinction matters at the dependency level: `ad936x` does not depend on
+//! this crate at all, so the transceiver driver cannot accidentally acquire an
+//! opinion about how it is wired up.
 
 use uhd_core::{Error, Result};
 
