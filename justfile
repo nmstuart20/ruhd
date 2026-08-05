@@ -38,7 +38,7 @@ doc-open:
 # Everything CI runs, in CI's order. Run this before pushing.
 ci: fmt-check clippy test doc
 
-# Run the CLI, e.g. `just cli find` or `just cli probe --args type=b200`.
+# Run the CLI, e.g. `just cli find` or `just cli probe usb`.
 cli *ARGS:
     cargo run --bin ruhd -- {{ARGS}}
 

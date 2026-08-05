@@ -22,9 +22,20 @@ uhd-transport = { path = "crates/uhd-transport", version = "0.1.0" }
 bytemuck = "1.19"
 clap = { version = "4.5", features = ["derive"] }
 num-complex = { version = "0.4.6", features = ["bytemuck"] }
+nusb = "0.2.7"
 thiserror = "2.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# `ruhd images download` only. Kept out of the driver crates on purpose: a
+# library that talks to hardware should not drag in a TLS stack, and nothing
+# below `uhd-cli` needs to fetch anything over the network.
+serde_json = "1.0"
+sha2 = "0.11"
+ureq = "3.3"
+# Default features pull in every codec zip supports; the images archives are
+# all deflate.
+zip = { version = "7.2", default-features = false, features = ["deflate"] }
 
 [workspace.lints.rust]
 missing_docs = "warn"

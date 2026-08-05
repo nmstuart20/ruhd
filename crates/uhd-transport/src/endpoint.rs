@@ -18,6 +18,21 @@ pub struct UsbEndpoint {
     pub address: Option<u8>,
 }
 
+impl std::fmt::Display for UsbEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "usb:{:04x}:{:04x}", self.vid, self.pid)?;
+        match &self.serial {
+            Some(serial) => write!(f, "/{serial}"),
+            // No serial: name the port instead, which is all an unprogrammed
+            // device has to distinguish it from its neighbour.
+            None => match (self.bus, self.address) {
+                (Some(bus), Some(address)) => write!(f, "@{bus}.{address}"),
+                _ => Ok(()),
+            },
+        }
+    }
+}
+
 /// Where a device lives.
 ///
 /// The point of this enum is that the layers above it — `chdr` packet framing,
@@ -45,10 +60,7 @@ impl Endpoint {
 impl std::fmt::Display for Endpoint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Usb(usb) => match &usb.serial {
-                Some(serial) => write!(f, "usb:{:04x}:{:04x}/{serial}", usb.vid, usb.pid),
-                None => write!(f, "usb:{:04x}:{:04x}", usb.vid, usb.pid),
-            },
+            Self::Usb(usb) => write!(f, "{usb}"),
             Self::Udp(addr) => write!(f, "udp:{addr}"),
         }
     }
