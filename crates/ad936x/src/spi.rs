@@ -28,6 +28,7 @@
 //! into the transceiver driver. Here that workaround is the backend's, where it
 //! is true.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 
@@ -78,6 +79,18 @@ const DATA_MASK: u32 = 0x0000_00ff;
 
 /// The highest register address the command word can express.
 pub const MAX_REG: u16 = (ADDR_MASK >> ADDR_SHIFT) as u16;
+
+/// Last register implemented by the AD9361/AD9364.
+///
+/// The 14-bit SPI address field can express addresses through [`MAX_REG`], but
+/// the transceiver's register map is the 1,024-byte range `0x000..=0x3ff`.
+/// Keeping this separate from the framing limit prevents a diagnostic dump
+/// from spending 16,384 SPI transactions reading addresses that are not part
+/// of the device.
+pub const LAST_DEVICE_REG: u16 = 0x03ff;
+
+/// A complete, address-ordered snapshot of the AD936x register file.
+pub type RegisterDump = BTreeMap<u16, u8>;
 
 /// The AD936x register file, reached over a [`SpiInterface`].
 ///
@@ -146,6 +159,24 @@ impl Registers {
                     .map_err(|_| Error::invalid_arg(format!("ad936x register {reg:#06x}+{i}")))?;
                 self.peek8(addr)
             })
+            .collect()
+    }
+
+    /// Reads the complete AD9361/AD9364 register file into an ordered map.
+    ///
+    /// This is a debug operation, not part of normal control flow. It performs
+    /// one SPI transaction for each address in `0x000..=0x3ff`, including
+    /// reserved, read-only, status, and indirect-port registers. Consequently
+    /// callers comparing two snapshots must account for volatile status bits.
+    /// The first failed transaction aborts the snapshot rather than returning a
+    /// partial map that could be mistaken for a complete dump.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the bus reports for the first register it cannot read.
+    pub fn debug_dump(&self) -> Result<RegisterDump> {
+        (0..=LAST_DEVICE_REG)
+            .map(|reg| self.peek8(reg).map(|value| (reg, value)))
             .collect()
     }
 
@@ -302,6 +333,22 @@ pub(crate) mod tests {
         // compare against garbage.
         let spi = Arc::new(FakeSpi::with_reads(&[0xdead_be08]));
         assert_eq!(Registers::new(spi).peek8(0x037).unwrap(), 0x08);
+    }
+
+    #[test]
+    fn debug_dump_reads_the_complete_device_register_file_in_address_order() {
+        let spi = Arc::new(FakeSpi::with_regs(&[
+            (0x000, 0x12),
+            (0x037, 0x0a),
+            (LAST_DEVICE_REG, 0x34),
+        ]));
+        let dump = Registers::new(spi.clone()).debug_dump().unwrap();
+
+        assert_eq!(dump.len(), usize::from(LAST_DEVICE_REG) + 1);
+        assert_eq!(dump.first_key_value(), Some((&0x000, &0x12)));
+        assert_eq!(dump.get(&0x037), Some(&0x0a));
+        assert_eq!(dump.last_key_value(), Some((&LAST_DEVICE_REG, &0x34)));
+        assert_eq!(spi.sent.lock().unwrap().len(), dump.len());
     }
 
     #[test]

@@ -35,5 +35,8 @@ name = "scratch_gate"
 [[example]]
 name = "codec_id"
 
+[[example]]
+name = "ad9364_regdump"
+
 [lints]
 workspace = true

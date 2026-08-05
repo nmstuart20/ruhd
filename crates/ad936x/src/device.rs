@@ -43,7 +43,7 @@ use crate::params::{ClientParams, ClockingMode, DigitalInterface, TimingMode};
 use crate::regs;
 use crate::regs::{ChipRegs, PRODUCT_ID_AD936X, ProductId};
 use crate::rfpll::{RfPll, SynthConfig};
-use crate::spi::{Registers, SpiInterface};
+use crate::spi::{RegisterDump, Registers, SpiInterface};
 use crate::tables::{
     GAIN_TABLE_1300_TO_4000_MHZ, GAIN_TABLE_4000_TO_6000_MHZ, GAIN_TABLE_SUB_1300_MHZ,
 };
@@ -189,6 +189,24 @@ impl Ad936x {
     #[must_use]
     pub fn regs(&self) -> &Registers {
         &self.regs
+    }
+
+    /// Reads all 1,024 AD9361/AD9364 registers into an address-ordered map.
+    ///
+    /// This deliberately bypasses the driver's shadow state and reports what
+    /// the part says now. It is intended for post-initialization comparison and
+    /// diagnostics; see [`Registers::debug_dump`] for the treatment of status,
+    /// reserved, and indirect-port addresses.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the underlying SPI bus reports.
+    pub fn debug_register_dump(&self) -> Result<RegisterDump> {
+        // Keep a tune, rate change, or gain update from producing a snapshot
+        // assembled from two different configurations. The SPI bus serializes
+        // individual transactions; the state lock serializes the whole dump.
+        let _state_guard = self.locked();
+        self.regs.debug_dump()
     }
 
     /// What the board said about itself at construction.

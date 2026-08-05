@@ -46,6 +46,13 @@ hw-test RELEASE:
 # Both legs of the hardware matrix CI runs, back to back.
 hw-matrix: (hw-test "v4.6.0.0") (hw-test "v4.10.0.0")
 
+# Phase 3 acceptance gate: initialize a B205mini with stock UHD and RUHD at
+# matched settings, dump all AD9364 registers after each, and reject every
+# undocumented bit difference. Extra arguments are passed to the harness, e.g.
+# `just register-gate --serial 3168B41 --rate 30720000`.
+register-gate *ARGS:
+    tools/validate_ad9364_registers.py {{ARGS}}
+
 # Lint. Warnings are errors, same as CI.
 clippy:
     cargo clippy --workspace --all-targets -- -D warnings

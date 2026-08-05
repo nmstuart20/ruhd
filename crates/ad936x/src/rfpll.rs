@@ -14,7 +14,7 @@ pub(crate) const RF_VCO_MAX: f64 = 12e9;
 pub struct RfPll {
     /// Integer part of the feedback divider.
     pub nint: u16,
-    /// Fractional numerator over [`RFPLL_MODULUS`].
+    /// Fractional numerator over the 8,388,593 modulus.
     pub nfrac: u32,
     /// Divider exponent written to register 0x005: 0 means /2, 6 means /128.
     pub divider_exp: u8,

@@ -511,6 +511,183 @@ platform where `char` is unsigned (ARM Linux) a UHD built there would compute a
 different value; the only consequence is one redundant FPGA load, since nothing
 but UHD ever interprets the number.
 
+## Phase 3 acceptance: the AD9364 register dump
+
+Phase 3 is gated by a register-for-register comparison, not just by observing
+the PLL lock bits. `Ad936x::debug_register_dump` reads the complete implemented
+AD9364 register file, addresses `0x000` through `0x3ff`, into an
+address-ordered `BTreeMap<u16, u8>`. This boundary is intentionally smaller
+than the SPI command's 14-bit address field: the command can encode through
+`0x3fff`, but the part implements 1,024 registers and UHD's highest access is
+`0x3fe`.
+
+Run the gate with one B205mini attached and the stock UHD development package
+installed:
+
+```sh
+just register-gate --serial 3168B41
+# or choose every matched setting explicitly
+just register-gate --serial 3168B41 --rate 30720000 \
+    --rx-freq 2450000000 --tx-freq 2450000000 \
+    --rx-gain 37 --tx-gain 10 --bandwidth 30720000
+```
+
+The defaults are a 16 MHz master/sample rate, 2.45 GHz RX and TX LOs, 37 dB RX
+gain, 10 dB TX gain, and analog bandwidth equal to the sample rate. Analog
+bandwidth is explicit because leaving UHD's 56 MHz frontend default in place
+would make the comparison unmatched even though rate, frequency, and gain were
+the same.
+
+The harness does the following, in this order:
+
+1. builds `tools/stock_uhd_ad9364_init.cpp` against the system's unmodified UHD;
+2. asks stock `multi_usrp` to initialize the device and applies the matched
+   master clock, RX/TX sample rates, LOs, manual gains, and bandwidths;
+3. lets stock UHD release the USB interfaces, then opens a write-free
+   `B200Session` and dumps the state stock UHD left in the chip;
+4. resets and initializes the same chip through RUHD, applies the same settings,
+   and dumps it again;
+5. verifies that both TSV files contain exactly 1,024 unique addresses and
+   diffs every bit.
+
+The handoff in step 3 is necessary because stock UHD does not publish its
+`ad9361_io::peek8` object in the B2xx property tree or public API. Reading it
+through RUHD's raw SPI debug hook after stock UHD exits gives an unmodified
+stock initialization baseline; opening the RUHD session constructs only
+write-free local-core peripherals and does not reset the codec. The stock and
+RUHD dumps plus requested settings and the detected UHD version are retained
+under `target/ad9364-register-validation/`. Existing dumps can be checked
+without hardware using `tools/validate_ad9364_registers.py --diff-only STOCK
+RUHD`.
+
+The gate passes only if the dumps are identical or each differing bit is masked
+in `tools/ad9364-register-diff.allow` and the same canonical address, mask,
+stock-UHD version glob, and explanation appear as a row in this section's
+table. `*` applies to every stock UHD version. A narrower glob is required when
+the difference is caused by a known stock-UHD implementation version. Whole-
+register exclusions are allowed by the format but should be exceptional; masks
+retain comparison of any stable or meaningful bits in the same byte.
+
+| Address | Allowed mask | Stock UHD | Explanation |
+| --- | --- | --- | --- |
+| 0x00c | 0xfe | * | Bit 0 is the temperature start command; bits 7:1 are asynchronous status or Open readback. |
+| 0x00e | 0xff | * | Periodic internal die-temperature ADC readback; it changes with time and temperature. |
+| 0x08e | 0xff | * | Tx1 phase correction is a measured quadrature-calibration result. |
+| 0x08f | 0xff | * | Tx1 gain correction is a measured quadrature-calibration result. |
+| 0x090 | 0xff | * | This Tx2 phase-correction result register is unavailable on AD9364 and has no stable readback contract. |
+| 0x091 | 0xff | * | This Tx2 gain-correction result register is unavailable on AD9364 and has no stable readback contract. |
+| 0x092 | 0xff | * | Tx1 I offset correction is a measured quadrature-calibration result. |
+| 0x093 | 0xff | * | Tx1 Q offset correction is a measured quadrature-calibration result. |
+| 0x094 | 0xff | * | This Tx2 I-offset result register is unavailable on AD9364 and has no stable readback contract. |
+| 0x095 | 0xff | * | This Tx2 Q-offset result register is unavailable on AD9364 and has no stable readback contract. |
+| 0x096 | 0xff | * | Tx1 output-2 phase correction is a measured quadrature-calibration result. |
+| 0x097 | 0xff | * | Tx1 output-2 gain correction is a measured quadrature-calibration result. |
+| 0x098 | 0xff | * | This Tx2 phase-correction result register is unavailable on AD9364 and has no stable readback contract. |
+| 0x099 | 0xff | * | This Tx2 gain-correction result register is unavailable on AD9364 and has no stable readback contract. |
+| 0x09a | 0xff | * | Tx1 output-2 I offset correction is a measured quadrature-calibration result. |
+| 0x09b | 0xff | * | Tx1 output-2 Q offset correction is a measured quadrature-calibration result. |
+| 0x09c | 0xff | * | This Tx2 I-offset result register is unavailable on AD9364 and has no stable readback contract. |
+| 0x09d | 0xff | * | This Tx2 Q-offset result register is unavailable on AD9364 and has no stable readback contract. |
+| 0x0a7 | 0xfc | * | Tx quadrature convergence count is calibration output; bits 1:0 must still agree that LO and SSB converged. |
+| 0x0c2 | 0x1f | * | Bits 4:0 are the measured Tx baseband-filter R1 result; reserved bits 7:5 must still agree. |
+| 0x0c3 | 0x1f | * | Bits 4:0 are the measured Tx baseband-filter R2 result; reserved bits 7:5 must still agree. |
+| 0x0c4 | 0x1f | * | Bits 4:0 are the measured Tx baseband-filter R3 result; reserved bits 7:5 must still agree. |
+| 0x0c5 | 0x1f | * | Bits 4:0 are the measured Tx baseband-filter R4 result; reserved bits 7:5 must still agree. |
+| 0x0c6 | 0x1f | * | Bits 4:0 are the measured Tx baseband-filter Rp result; reserved bits 7:5 must still agree. |
+| 0x0c7 | 0x3f | * | Bits 5:0 are the measured Tx baseband-filter C1 result; reserved bits 7:6 must still agree. |
+| 0x0c8 | 0x3f | * | Bits 5:0 are the measured Tx baseband-filter C2 result; reserved bits 7:6 must still agree. |
+| 0x0c9 | 0x3f | * | Bits 5:0 are the measured Tx baseband-filter Cp result; reserved bits 7:6 must still agree. |
+| 0x0cc | 0xff | * | The defined low nibble is Tx baseband-filter calibration output and the upper nibble is Open. |
+| 0x160 | 0xff | * | Channel-1 ADC power is a live received-signal measurement. |
+| 0x161 | 0xff | * | Channel-1 RX-filter power is a live received-signal measurement. |
+| 0x162 | 0xff | * | The channel-2 ADC power measurement register is unavailable on AD9364 and has no stable readback contract. |
+| 0x163 | 0xff | * | The channel-2 RX-filter power measurement register is unavailable on AD9364 and has no stable readback contract. |
+| 0x170 | 0xff | * | RxA phase correction is a measured quadrature-calibration result. |
+| 0x171 | 0xff | * | RxA gain correction is a measured quadrature-calibration result. |
+| 0x172 | 0xff | * | The AD9364 register map marks this Rx correction-bank byte Open with no stable readback contract. |
+| 0x173 | 0xff | * | The AD9364 register map marks this Rx correction-bank byte Open with no stable readback contract. |
+| 0x174 | 0xff | * | RxA Q DC-offset correction is a measured quadrature-calibration result. |
+| 0x175 | 0xff | * | RxA I/Q DC-offset correction is a measured quadrature-calibration result. |
+| 0x176 | 0xff | * | Its lower nibble is measured Rx1 I DC correction; its upper nibble is the unavailable Rx2 Q field on AD9364. |
+| 0x177 | 0xff | * | The AD9364 register map marks this Rx correction-bank byte Open with no stable readback contract. |
+| 0x178 | 0xff | * | The AD9364 register map marks this Rx correction-bank byte Open with no stable readback contract. |
+| 0x17d | 0xff | * | RxB/C Q DC-offset correction is a measured quadrature-calibration result. |
+| 0x17e | 0xff | * | RxB/C I/Q DC-offset correction is a measured quadrature-calibration result. |
+| 0x17f | 0xff | * | Its lower nibble is measured Rx1 I DC correction; its upper nibble is the unavailable Rx2 Q field on AD9364. |
+| 0x180 | 0xff | * | The AD9364 register map marks this Rx correction-bank byte Open with no stable readback contract. |
+| 0x181 | 0xff | * | The AD9364 register map marks this Rx correction-bank byte Open with no stable readback contract. |
+| 0x19a | 0x7f | * | Bits 6:0 are the Rx1 baseband I DC-offset correction MSBs; reserved bit 7 must still agree. |
+| 0x19b | 0xff | * | Rx baseband I DC-offset correction is analog calibration output for the current LPF gain. |
+| 0x19c | 0x7f | * | Bits 6:0 are the Rx1 baseband Q DC-offset correction MSBs; reserved bit 7 must still agree. |
+| 0x19d | 0xff | * | Rx baseband Q DC-offset correction is analog calibration output for the current LPF gain. |
+| 0x19e | 0x7f | * | Bits 6:0 are the unavailable Rx2 baseband I correction MSBs on AD9364; reserved bit 7 must still agree. |
+| 0x19f | 0xff | * | This is the unavailable Rx2 baseband I correction LSB byte on AD9364 and has no stable readback contract. |
+| 0x1a0 | 0x7f | * | Bits 6:0 are the unavailable Rx2 baseband Q correction MSBs on AD9364; reserved bit 7 must still agree. |
+| 0x1a1 | 0xff | * | The AD9364 register map marks this baseband DC-offset-bank byte Open with no stable readback contract. |
+| 0x1a7 | 0xff | * | RSSI symbol readback updates after every measurement interval and depends on the received signal. |
+| 0x1a8 | 0xff | * | RSSI preamble readback is measurement output and depends on the received signal. |
+| 0x1a9 | 0xff | * | The AD9364 register map marks this RSSI-bank byte Open with no stable readback contract. |
+| 0x1aa | 0xff | * | The AD9364 register map marks this RSSI-bank byte Open with no stable readback contract. |
+| 0x1ab | 0xff | * | Bits 1:0 are RSSI symbol measurement LSBs and bits 7:2 are Open. |
+| 0x1ac | 0xff | * | Bits 1:0 are RSSI preamble measurement LSBs and bits 7:2 are Open. |
+| 0x1f3 | 0x7f | * | Bits 6:0 are Rx baseband-filter calibration results; bit 7 is the bypass control and must still agree. |
+| 0x233 | 0x01 | 4.6.* | UHD 4.6 truncates a half-LSB RFPLL fraction; UHD 4.10, RUHD, and UG-672 round it. |
+| 0x236 | 0x7f | * | Bits 6:0 are the measured RX ALC word; bit 7 is Force ALC Enable and must still agree. |
+| 0x244 | 0x4f | * | Bit 6 is Open and bits 3:0 are the RX charge-pump calibration word; valid, done, and busy bits must agree. |
+| 0x273 | 0x01 | 4.6.* | UHD 4.6 truncates a half-LSB RFPLL fraction; UHD 4.10, RUHD, and UG-672 round it. |
+| 0x276 | 0x7f | * | Bits 6:0 are the measured TX ALC word; bit 7 is Force ALC Enable and must still agree. |
+| 0x284 | 0x4f | * | Bit 6 is Open and bits 3:0 are the TX charge-pump calibration word; valid, done, and busy bits must agree. |
+| 0x299 | 0xff | * | This undocumented readback changes across consecutive dumps without a configuration change. |
+
+Three bench runs were completed on 2026-08-05 with B205mini serial `3168B41`,
+stock UHD `4.6.0.HEAD-0-g50fa3baa`, and the default matched settings. They found
+26, 27, and 27 differing addresses, with 35 distinct addresses across the
+runs. Apart from the RFPLL exception below, these are calibration results,
+periodic measurements, open fields, or the undocumented changing readback at
+`0x299`. These classifications follow the AD9364 [UG-672 register map][ug672]
+and Analog Devices' [no-OS register definitions][adi-no-os-registers]. Analog
+Devices also shows `0x170`--`0x172` and `0x299` changing between consecutive,
+otherwise-identical [SPI dumps][adi-changing-registers].
+
+The masks cover complete volatile field classes rather than only the values
+that happened to change in one snapshot. Thus the companion `0x08f`, `0x093`,
+`0x19a`, `0x19e`, `0x1a0`, `0x276`, and `0x284` result fields are documented
+even when equal in the retained runs. Control and health bits remain compared:
+the start bit at `0x00c`, convergence flags at `0x0a7`, reserved MSBs in the
+baseband correction words, filter bypass at `0x1f3`, Force ALC enables, and the
+synthesizer calibration valid/done/busy flags are all outside their allowance
+masks.
+
+After the stock baseline was upgraded to UHD `4.10.0.HEAD-0-g2af4ddb9`, later
+runs exposed two more members of already-volatile measurement classes:
+channel-1 RX-filter power at `0x161` and the RSSI preamble LSBs at `0x1ac`.
+Their complete companion groups, `0x160`--`0x163` and `0x1ab`--`0x1ac`, are
+allowlisted because every defined bit is live received-signal data (and the
+AD9364-unavailable channel-2 or unused bits are Open), not device
+configuration.
+
+Additional UHD 4.10 runs exercised more members of the Tx calibration banks.
+The complete `0x08e`--`0x09d` block is now covered as Tx quadrature correction
+output or AD9364-unavailable Tx2 readback. The complete component-result block
+at `0x0c2`--`0x0c9` is covered with its documented field widths: five bits for
+R1/R2/R3/R4/Rp and six bits for C1/C2/Cp. Their reserved upper bits remain
+compared, as do all control registers surrounding the result block.
+
+The remaining two differences, RX `0x233` and TX `0x273`, are the least
+significant RFPLL fractional byte. At 2.45 GHz the ideal fractional word ends
+in exactly one half: stock UHD 4.6 truncates it to `0x3ffff8`, while RUHD and
+the pinned UHD 4.10 implementation round it to `0x3ffff9`, as required by
+UG-672 Equation 25. That allowance is therefore confined to `4.6.*`; it will
+fail against a newer stock UHD if the bytes still differ.
+
+Gate status: **accepted**. Replaying the latest retained stock and RUHD
+snapshots through `--diff-only` compares all 1,024 addresses and accepts all 27
+observed differences solely under the documented masks above.
+
+[ug672]: https://www.analog.com/media/cn/technical-documentation/user-guides/ad9364_register_map_reference_manual_ug-672.pdf
+[adi-no-os-registers]: https://github.com/analogdevicesinc/no-OS/blob/master/drivers/rf-transceiver/ad9361/ad9361.h
+[adi-changing-registers]: https://ez.analog.com/linux-software-drivers/f/q-a/87687/ad9361-reading-configuration-registers-via-spi
+
 ## Licensing
 
 UHD is GPL-3.0-or-later. This is a reimplementation written while reading UHD's

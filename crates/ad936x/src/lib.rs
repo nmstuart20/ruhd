@@ -81,7 +81,7 @@ pub use params::{
 };
 pub use regs::{ChipRegs, PRODUCT_ID_AD936X, ProductId};
 pub use rfpll::RfPll;
-pub use spi::{MAX_REG, Registers, SPI_NUM_BITS, SpiInterface};
+pub use spi::{LAST_DEVICE_REG, MAX_REG, RegisterDump, Registers, SPI_NUM_BITS, SpiInterface};
 
 /// Highest RX gain the part reports, in dB. `AD9361_MAX_GAIN`.
 pub const MAX_GAIN: f64 = 89.75;
