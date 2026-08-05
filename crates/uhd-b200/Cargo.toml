@@ -8,6 +8,11 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+chdr.workspace = true
+nusb.workspace = true
+tracing.workspace = true
+uhd-core.workspace = true
+uhd-transport.workspace = true
 
 [lints]
 workspace = true

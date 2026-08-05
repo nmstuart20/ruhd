@@ -288,7 +288,8 @@ impl Fx3Iface {
     /// bulk interfaces, and it takes a clone rather than a second `open` so
     /// that both halves of the device are reached through one handle — which
     /// is what UHD's cached-handle scheme achieves the hard way.
-    pub(crate) fn device(&self) -> nusb::Device {
+    #[doc(hidden)]
+    pub fn device(&self) -> nusb::Device {
         self.device.clone()
     }
 
