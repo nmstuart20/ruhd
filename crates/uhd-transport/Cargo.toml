@@ -1,0 +1,15 @@
+[package]
+name = "uhd-transport"
+description = "Link, register and serial-bus traits shared by ruhd device backends"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+uhd-core.workspace = true
+
+[lints]
+workspace = true

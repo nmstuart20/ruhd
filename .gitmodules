@@ -1,0 +1,4 @@
+[submodule "reference/uhd"]
+	path = reference/uhd
+	url = https://github.com/EttusResearch/uhd.git
+	shallow = true

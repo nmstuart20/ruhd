@@ -1,0 +1,18 @@
+[package]
+name = "uhd-core"
+description = "Device, streamer and value types for a pure-Rust USRP hardware driver"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+bytemuck.workspace = true
+num-complex.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

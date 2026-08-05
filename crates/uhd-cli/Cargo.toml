@@ -1,0 +1,23 @@
+[package]
+name = "uhd-cli"
+description = "Command-line tools for ruhd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "ruhd"
+path = "src/main.rs"
+
+[dependencies]
+uhd-core.workspace = true
+
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true
