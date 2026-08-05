@@ -23,7 +23,7 @@
 //! # let params: ClientParams = unimplemented!();
 //! let codec = Ad936x::new(spi, params);
 //! println!("{}", codec.identify()?); // AD936x rev 2 (0x0a)
-//! let rate = codec.initialize_clocking()?; // 50 MHz, and the radio ticks
+//! let rate = codec.init()?; // complete bring-up at 50 MHz
 //! # Ok(())
 //! # }
 //! ```
@@ -59,27 +59,28 @@
 //! - [`clocking`] — the rate table, the BBPLL divide word, the DAC divider and
 //!   the FIR tap budgets, as pure functions.
 //! - [`fir`] — the eight coefficient tables and the indirect write sequence.
-//! - [`device`] — reset, the identity gate, the clock path, the whole of
-//!   `_setup_rates`, the data port and the interface delays.
+//! - [`device`] — complete initialization, RF and sample-rate tuning, manual and
+//!   automatic gain control, analog filters, ADC setup, DC calibration, and RX/TX
+//!   quadrature calibration.
 //!
-//! Not here yet: RF tuning, gain tables and gain control, the analog filter
-//! calibrations, DC offset and quadrature calibration, RSSI and temperature, and
-//! the public `set_clock_rate` that wraps [`Ad936x::setup_rates`] in the ENSM
-//! transitions and re-calibration it needs to be safe on a running radio. See
-//! [`device`] for why that last one waits.
+//! RSSI, temperature, test-tone, loopback, and the generic filter introspection
+//! API are intentionally outside this bring-up slice.
 
 pub mod clocking;
 pub mod device;
 pub mod fir;
 pub mod params;
 pub mod regs;
+mod rfpll;
 pub mod spi;
+mod tables;
 
 pub use device::{Ad936x, CLOCK_SETTLING, INIT_CLOCK_RATE, RESET_SETTLING};
 pub use params::{
     BandEdges, ClientParams, ClockingMode, DigitalInterface, InterfaceDelays, TimingMode,
 };
 pub use regs::{ChipRegs, PRODUCT_ID_AD936X, ProductId};
+pub use rfpll::RfPll;
 pub use spi::{MAX_REG, Registers, SPI_NUM_BITS, SpiInterface};
 
 /// Highest RX gain the part reports, in dB. `AD9361_MAX_GAIN`.
@@ -150,4 +151,15 @@ pub enum Chain {
     Two,
     /// Both, which is what everything in the initialisation path uses.
     Both,
+}
+
+/// Receive gain-control mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GainMode {
+    /// Host writes the gain-table index directly.
+    Manual,
+    /// Slow attack automatic gain control.
+    SlowAgc,
+    /// Fast attack automatic gain control.
+    FastAgc,
 }

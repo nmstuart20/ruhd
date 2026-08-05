@@ -4,7 +4,7 @@
 //! Only the registers something in this crate actually touches appear here. The
 //! AD936x has around a thousand of them and transcribing the map wholesale would
 //! be a large file that nothing reads; the ones the initialisation sequence
-//! walks arrive with the code that walks them.
+//! walks stay beside the fixed sequences that use them.
 //!
 //! # About the names
 //!
@@ -153,7 +153,7 @@ pub const RX_FIR_BASE: u16 = 0x0f0;
 /// part, not the part's reset values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChipRegs {
-    /// RF VCO dividers. Owned by the RF tuning code; part 2.
+    /// RF VCO dividers. Owned by the RF tuning code.
     pub vcodivs: u8,
     /// [`INPUT_SELECT`]. Owned by the RF tuning code; `_setup_rates` only
     /// writes it out.
@@ -165,11 +165,9 @@ pub struct ChipRegs {
     pub txfilt: u8,
     /// [`BBPLL`]. Bits 2:0 from `_tune_bbvco`, bit 3 from `_setup_rates`.
     pub bbpll: u8,
-    /// Baseband filter tune config. Owned by the analog filter calibration;
-    /// part 2.
+    /// Baseband filter tune config. Owned by the analog filter calibration.
     pub bbftune_config: u8,
-    /// Baseband filter tune mode. Owned by the analog filter calibration;
-    /// part 2.
+    /// Baseband filter tune mode. Owned by the analog filter calibration.
     pub bbftune_mode: u8,
 }
 

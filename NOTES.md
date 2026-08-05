@@ -556,19 +556,14 @@ On top of that sit the settings-bus peripherals, one module each:
 | `atr` | `gpio_atr_3000.cpp`, `update_atrs` | radio |
 | `time_core` | `time_core_3000.cpp`, `update_time_source`, `set_time` | radio |
 
-`ad936x` has the bus, the identity check and the clock chain: the 24-bit command
-framing, the register file, the soft reset and the product-ID read that
-`ad9361_device_t::initialize` opens with, and then the first half of that
-sequence — the reference clock path, `_setup_rates` in full (the rate table, the
-BBPLL divide word, the DAC divider and both FIR filters), the data port and the
-interface delays. The arithmetic is split out into `ad936x::clocking` as pure
-functions, so the numbers can be checked against the C++ without a board.
-
-Nothing above that yet: no RF tuning, gain tables, analog filter calibration,
-DC-offset or quadrature calibration, and no public `set_clock_rate` — the
-reference's wraps `_setup_rates` in ENSM transitions and seven re-calibrations,
-and shipping the wrapper without them would give a part that clocks at the new
-rate and receives badly.
+`ad936x` now reproduces `ad9361_device_t::initialize` end to end: SPI and the
+identity gate; BBPLL and RFPLL integer/fractional synthesis; the characterized
+VCO, mixer and three receive-gain tables; manual gain and AGC modes; the FIR and
+analog filter chains; ADC setup; DC-offset, RF-DC and RX/TX quadrature
+calibration; and the ENSM transitions around initialization and sample-rate
+changes. `init`, `tune`, `set_gain`, and `set_sample_rate` are the operational
+entry points. The clock and RF synthesizer arithmetic is split into pure
+functions so its divide words can be checked without a board.
 
 Verified against the bench B205mini (serial `3168B41`, FPGA compat 7.0), on a
 device whose codec no other process had touched.
@@ -617,12 +612,9 @@ Rough order of work from here:
 2. ~~**The settings-bus peripherals**~~ — done: `spi`, `misc`, `atr`,
    `time_core`, and `ad936x`'s SPI register access. The codec product-ID gate is
    the proof.
-3. `ad936x` — the initialisation sequence. The clock half is done: BBPLL, the
-   clock tree, the rate table, the FIRs and the digital interface. What remains
-   is the ENSM transitions, RF tuning, the gain and mixer tables, the analog
-   filter calibrations, the DC-offset and quadrature calibrations, and the
-   public `set_clock_rate` that needs them. `ad9361_device.cpp` is 3011 lines
-   and most of them are still here.
+3. ~~`ad936x` — the initialisation sequence.~~ Done through complete RF/sample
+   rate tuning, gain, filtering, and calibration; hardware validation of the
+   full path remains.
 4. `uhd-b200` — a real `Device` impl over all of it: the EEPROM read for
    identity, tick rate, tuning, gain. Enough for `ruhd find` to print a real
    B205mini.

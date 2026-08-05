@@ -8,19 +8,17 @@
 //! cargo test -p uhd-b200 --features hw-tests -- --test-threads 1
 //! ```
 //!
-//! # Why this one can run in CI and the scratch gate cannot
+//! # Why these tests can bootstrap an untouched radio
 //!
 //! Everything here is on the FPGA's local core: the misc GPIO word that holds
 //! the codec's reset line, and `spi_core_3000`. Both answer as soon as the
 //! bitstream is in. The radio cores — where `hw_compat`'s scratch gate lives —
-//! need the AD936x to be clocking *and* out of its wait state, and the ENSM
-//! transitions that do the second half are not ported yet.
+//! need the AD936x to be clocking *and* out of its wait state. The final test
+//! now drives the complete codec initialization and verifies that boundary.
 //!
-//! So this file is the boundary of what can be proven today without a stock
-//! `uhd_usrp_probe` having run first, and it is a real boundary rather than a
-//! convenient one: a passing product-ID read is the evidence that the SPI path
-//! the initialisation sequence uses is correct, and a locked BBPLL is the
-//! evidence that the clock chain built on top of it is.
+//! A passing product-ID read is evidence that the SPI path is correct, a locked
+//! BBPLL proves the clock math, and FDD plus both RFPLL lock bits proves the
+//! complete initialization path reached the state that clocks the radio cores.
 //!
 //! # These tests change the device
 //!
@@ -231,5 +229,27 @@ fn the_chain_re_solves_for_every_rate_the_board_is_asked_for() {
             codec.adc_freq() / 1e6,
             codec.bbpll_freq() / 1e6
         );
+    }
+}
+
+#[test]
+fn complete_initialization_reaches_fdd_with_both_rfplls_locked() {
+    let session = session();
+    session.codec_gate().expect("the codec bring-up gate");
+    let codec = session.codec();
+    let rate = codec.init().expect("complete ad936x initialization");
+
+    assert!(freq_is_nearly_equal(rate, ad936x::INIT_CLOCK_RATE));
+    let ensm = codec.regs().peek8(0x017).expect("reading ENSM state") & 0x0f;
+    assert_eq!(
+        ensm, 0x0a,
+        "complete initialization stopped in ENSM state {ensm:#x}"
+    );
+    for (name, register) in [("RX", 0x247), ("TX", 0x287)] {
+        let status = codec
+            .regs()
+            .peek8(register)
+            .unwrap_or_else(|e| panic!("reading {name} RFPLL status: {e}"));
+        assert_ne!(status & 0x02, 0, "{name} RFPLL lost lock: {status:#04x}");
     }
 }
