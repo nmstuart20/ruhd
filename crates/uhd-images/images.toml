@@ -1,0 +1,40 @@
+manifest_version = 1
+
+# These payload hashes and sizes were calculated from the named files inside
+# the official files.ettus.com archives. Archive hashes are retained so sync
+# authenticates the download before extracting the content-addressed payload.
+[[image]]
+device = "b205mini"
+kind = "firmware"
+fpga_compat_major = 7
+fpga_compat_minor = 0
+release = ["v4.6.0.0", "v4.7.0.0", "v4.8.0.0", "v4.9.0.0", "v4.10.0.0"]
+filename = "usrp_b200_fw.hex"
+sha256 = "cc8e4bc968d91d1a67c63871ce5b2c1613c49676fe363bf2f6e336059899ae5c"
+size = 514346
+source_url = "https://files.ettus.com/binaries/cache/b2xx/uhd-7f7d016/b2xx_common_fw_default-g7f7d016.zip"
+archive_sha256 = "22ac0e54cc90d53d8494d481439447a0c89b9bbaced6fabe24df260eda3ce3a3"
+
+[[image]]
+device = "b205mini"
+kind = "fpga"
+fpga_compat_major = 7
+fpga_compat_minor = 0
+release = ["v4.6.0.0"]
+filename = "usrp_b205mini_fpga.bin"
+sha256 = "7e4ff6be043697c888bdbeb5fd9fd639336cc8137f5ca2e6b3e632be81c7f758"
+size = 4222976
+source_url = "https://files.ettus.com/binaries/cache/b2xx/uhd-92c09f7/b2xx_b205mini_fpga_default-g92c09f7.zip"
+archive_sha256 = "7b58b5d3efef2012f987ecccd1decba5cc15b4cd8353495115e298f85b383131"
+
+[[image]]
+device = "b205mini"
+kind = "fpga"
+fpga_compat_major = 7
+fpga_compat_minor = 0
+release = ["v4.7.0.0", "v4.8.0.0", "v4.9.0.0", "v4.10.0.0"]
+filename = "usrp_b205mini_fpga.bin"
+sha256 = "f4da0becf906af957c954a7a1c276aa91f79ca369d7aedf7c2f5c7fdebf4c351"
+size = 4223252
+source_url = "https://files.ettus.com/binaries/cache/b2xx/uhd-c37b318/b2xx_b205mini_fpga_default-gc37b318.zip"
+archive_sha256 = "dce96120e3512d6e21bb061811c4021cbc90ac4d787248ad821337b7389ff3c4"

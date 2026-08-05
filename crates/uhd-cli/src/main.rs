@@ -158,6 +158,36 @@ enum ImagesAction {
     Status,
     /// Download the B2xx images package.
     Download(DownloadArgs),
+    /// Fetch exact images needed by attached or specified devices.
+    Sync(ImageSelectionArgs),
+    /// Hash and size-check every selected cached image.
+    Verify(ImageSelectionArgs),
+    /// Create an air-gap bundle containing selected images and its lockfile.
+    Export {
+        /// Output tar archive.
+        bundle: PathBuf,
+        #[command(flatten)]
+        selection: ImageSelectionArgs,
+    },
+    /// Import and verify an air-gap bundle.
+    Import {
+        /// Bundle created by `images export`.
+        bundle: PathBuf,
+    },
+}
+
+#[derive(Debug, Args)]
+struct ImageSelectionArgs {
+    /// Device family to resolve (currently b205mini). Repeatable. If omitted,
+    /// attached devices are detected.
+    #[arg(long, value_name = "DEVICE")]
+    device: Vec<String>,
+    /// Pin the image set from this UHD tag, e.g. v4.6.0.0.
+    #[arg(long)]
+    release: Option<String>,
+    /// Lockfile path (default: ./uhd-images.lock).
+    #[arg(long)]
+    lockfile: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -230,6 +260,10 @@ fn run(command: &Command) -> Result<()> {
         Command::Images { action } => match action {
             ImagesAction::Status => images_status(),
             ImagesAction::Download(args) => images_download(args),
+            ImagesAction::Sync(args) => images_sync(args),
+            ImagesAction::Verify(args) => images_verify(args),
+            ImagesAction::Export { bundle, selection } => images_export(bundle, selection),
+            ImagesAction::Import { bundle } => images_import(bundle),
         },
         Command::Backends => {
             let types = registry::registered_types();
@@ -544,7 +578,10 @@ fn load_fpga(iface: &usb::Fx3Iface, device: &usb::UsbProbe, args: &InitArgs) -> 
             }
             path.clone()
         }
-        None => image_paths::find_image(usb::image_for(device, iface)?)?,
+        None => {
+            let product = usb::image_for(device, iface)?;
+            cached_image("fpga", product).unwrap_or(image_paths::find_image(product)?)
+        }
     };
 
     println!();
@@ -632,6 +669,9 @@ fn resolve_firmware(override_path: Option<&std::path::Path>) -> Result<PathBuf> 
         return Ok(path.to_path_buf());
     }
 
+    if let Some(path) = cached_image("firmware", usb::B200_FW_IMAGE) {
+        return Ok(path);
+    }
     let path = image_paths::find_image(usb::B200_FW_IMAGE)?;
 
     let target = images::FIRMWARE_TARGET;
@@ -658,6 +698,18 @@ fn resolve_firmware(override_path: Option<&std::path::Path>) -> Result<PathBuf> 
     }
 
     Ok(path)
+}
+
+fn cached_image(kind: &str, filename: &str) -> Option<PathBuf> {
+    let manifest = uhd_images::Manifest::builtin().ok()?;
+    let image = manifest
+        .images
+        .iter()
+        .rev()
+        .find(|i| i.kind == kind && i.filename == filename)?;
+    let cache = uhd_images::Cache::discover().ok()?;
+    cache.verify(image).ok()?;
+    Some(cache.object_path(&image.sha256))
 }
 
 /// Picks the one device to initialise, or explains why it cannot.
@@ -862,6 +914,107 @@ fn print_sensors(device: &dyn Device, scope: SensorScope) {
             Err(e) => println!("      sensor {name}: <{e}>"),
         }
     }
+}
+
+fn image_error(e: uhd_images::Error) -> Error {
+    Error::Firmware(e.to_string())
+}
+
+fn lock_path(args: &ImageSelectionArgs) -> PathBuf {
+    args.lockfile
+        .clone()
+        .or_else(|| std::env::var_os(uhd_images::LOCK_ENV).map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("uhd-images.lock"))
+}
+
+fn image_selection(args: &ImageSelectionArgs) -> Result<Vec<uhd_images::Image>> {
+    let path = lock_path(args);
+    if path.is_file() && args.device.is_empty() && args.release.is_none() {
+        return uhd_images::Lockfile::read(&path)
+            .map(|l| l.images)
+            .map_err(image_error);
+    }
+    let mut devices = args.device.clone();
+    if devices.is_empty() {
+        for found in usb::probe().unwrap_or_default() {
+            if found.product == Some(usb::B2xxProduct::B205Mini) {
+                devices.push("b205mini".to_owned());
+            }
+        }
+    }
+    if devices.is_empty() {
+        return Err(Error::invalid_arg(
+            "no supported device detected; specify one with --device b205mini",
+        ));
+    }
+    for device in &devices {
+        if !device.eq_ignore_ascii_case("b205mini") {
+            return Err(Error::invalid_arg(format!(
+                "unsupported image device `{device}`"
+            )));
+        }
+    }
+    let manifest = uhd_images::Manifest::builtin().map_err(image_error)?;
+    let selected = manifest.select(&devices, args.release.as_deref());
+    if selected.is_empty() {
+        return Err(Error::invalid_arg(format!(
+            "no manifest images match release {}",
+            args.release.as_deref().unwrap_or("<latest>")
+        )));
+    }
+    Ok(selected)
+}
+
+fn images_sync(args: &ImageSelectionArgs) -> Result<()> {
+    let selected = image_selection(args)?;
+    let cache = uhd_images::Cache::discover().map_err(image_error)?;
+    println!("cache: {}", cache.root().display());
+    cache
+        .sync(&selected, |line| println!("{line}"))
+        .map_err(image_error)?;
+    let lock = uhd_images::Lockfile::from_images(&selected);
+    let path = lock_path(args);
+    lock.write(&path).map_err(image_error)?;
+    println!("lock:  {}", path.display());
+    Ok(())
+}
+
+fn images_verify(args: &ImageSelectionArgs) -> Result<()> {
+    let selected = image_selection(args)?;
+    let cache = uhd_images::Cache::discover().map_err(image_error)?;
+    for image in &selected {
+        cache.verify(image).map_err(image_error)?;
+        println!("ok {} {}", image.sha256, image.filename);
+    }
+    Ok(())
+}
+
+fn images_export(bundle: &std::path::Path, args: &ImageSelectionArgs) -> Result<()> {
+    let selected = image_selection(args)?;
+    let cache = uhd_images::Cache::discover().map_err(image_error)?;
+    cache.export(&selected, bundle).map_err(image_error)?;
+    println!(
+        "exported {} image(s) to {}",
+        selected.len(),
+        bundle.display()
+    );
+    Ok(())
+}
+
+fn images_import(bundle: &std::path::Path) -> Result<()> {
+    let cache = uhd_images::Cache::discover().map_err(image_error)?;
+    let lock = cache.import(bundle).map_err(image_error)?;
+    let path = std::env::var_os(uhd_images::LOCK_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("uhd-images.lock"));
+    lock.write(&path).map_err(image_error)?;
+    println!(
+        "imported {} image(s) into {}",
+        lock.images.len(),
+        cache.root().display()
+    );
+    println!("lock: {}", path.display());
+    Ok(())
 }
 
 #[cfg(test)]
