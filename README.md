@@ -7,9 +7,10 @@ the USRP B205mini first.
 works against real hardware: `ruhd probe usb` finds and classifies a B2xx, and
 `ruhd init` takes one from freshly plugged in to FX3 firmware running, FPGA
 configured, and a live settings bus. Stock `uhd_usrp_probe` then opens the same
-device without reloading anything. There is still no device backend, so `ruhd
-find` finds nothing and no samples move. See [NOTES.md](NOTES.md) for the design
-rationale, the reference material, and the plan.
+device without reloading anything. `ruhd find` discovers firmware-ready B2xx
+devices; the generic device/streamer implementation is not complete, so no
+samples move yet. See [NOTES.md](NOTES.md) for the design rationale, the
+reference material, and the plan.
 
 ## Layout
 
@@ -19,7 +20,7 @@ rationale, the reference material, and the plan.
 | `uhd-transport` | Link, register and serial-bus traits; USB discovery, FX3 firmware and FPGA loading, the EEPROM map and settings-bus access (`usb`); image path resolution (`images`). |
 | `chdr` | Packet framing. Empty. |
 | `ad936x` | AD9361/AD9364 transceiver driver: complete initialization, RF/sample-rate tuning, gain tables and AGC, FIR/analog filters, and DC/quadrature calibration. |
-| `uhd-b200` | B2xx backend, including the B205mini. Empty. |
+| `uhd-b200` | B2xx discovery, compatibility policy, open session, settings-bus peripherals, and AD936x board integration. |
 | `uhd-cli` | The `ruhd` binary. |
 
 ## Getting started
@@ -46,15 +47,22 @@ It is not needed to build anything.
 ## Finding a device
 
 ```sh
+just cli find                       # firmware-ready devices and their identity
+just cli find --args type=b200,serial=30A1B2C
 just cli probe usb                  # every B2xx and unprogrammed FX3 on the bus
 just cli probe usb --serial 30A1B2C
 just cli probe usb --vid 2500 --pid 0022
 ```
 
-This is USB-level discovery: it enumerates the bus, reads descriptors and says
-what each device is and how far along it is. It works before any backend exists
-and before firmware has been loaded, which is what makes it the thing to run
-when a device is not showing up.
+`find` is read-only and reports boards whose FX3 firmware is running, using the
+motherboard EEPROM for the product, serial, name, and hardware revision. It
+does not implicitly load firmware: if a newly plugged-in board is absent, use
+`probe usb` to see its pre-firmware state and `init` to bring it up.
+
+`probe usb` is lower-level discovery: it enumerates the bus, reads descriptors
+and says what each device is and how far along it is. It works before any
+backend exists and before firmware has been loaded, which is what makes it the
+thing to run when a device is not showing up.
 
 ```
 Device 0

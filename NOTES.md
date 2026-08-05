@@ -722,7 +722,8 @@ hardware path is `uhd_transport::usb`, which now takes a device all the way from
 `FpgaCompat` enum and its shims), `policy` (the accept / reload / refuse
 decision), `session` (the open path and the read-only `checkup`), and
 `radio_ctrl` promoted to open against a negotiated major. `ruhd doctor` is the
-CLI front end. It is not yet a `Device` impl — `ruhd find` still finds nothing.
+CLI front end. Its discovery factory supplies `ruhd find`; it is not yet a
+generic `Device` impl.
 
 On top of that sit the settings-bus peripherals, one module each:
 
@@ -775,8 +776,10 @@ Verified against a B205mini, from a bootloader-state device:
   `ruhd init` reports the FPGA already current and skips it, because the image
   hashes agree.
 
-`ruhd find` still finds nothing because no backend registers itself yet, and no
-samples move.
+`ruhd find` now registers a B2xx discovery factory and reports firmware-ready
+boards from their motherboard EEPROM without changing device state. The
+factory's generic `Device` open path remains deliberately unsupported until the
+trait implementation below lands, and no samples move.
 
 `nusb` rather than `rusb`/`libusb`: it is pure Rust, so the build has no C
 dependency, and its enumeration reads sysfs without opening anything, which is
@@ -792,9 +795,8 @@ Rough order of work from here:
 3. ~~`ad936x` — the initialisation sequence.~~ Done through complete RF/sample
    rate tuning, gain, filtering, and calibration; hardware validation of the
    full path remains.
-4. `uhd-b200` — a real `Device` impl over all of it: the EEPROM read for
-   identity, tick rate, tuning, gain. Enough for `ruhd find` to print a real
-   B205mini.
+4. `uhd-b200` — discovery/EEPROM identity is done; implement a real `Device`
+   over the open session: tick rate, tuning, gain, antenna and streamers.
 5. `chdr` — packet framing.
 6. `uhd-b200` streamers — first samples.
 
@@ -802,7 +804,7 @@ Step 3 is the one that unblocks the rest: the scratch gate in `hw_compat.rs` and
 the two radio-core modules all become runnable the moment the codec is clocking,
 and `RUHD_HW_RADIO_CLOCKED` can go away with them.
 
-When step 4 lands, `register_backends()` in `crates/uhd-cli/src/main.rs` becomes
-`uhd_b200::register()` and the CLI needs no other change.
+`register_backends()` in `crates/uhd-cli/src/main.rs` now calls
+`uhd_b200::register()`.
 
 [nusb]: https://docs.rs/nusb

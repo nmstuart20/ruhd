@@ -62,6 +62,7 @@
 pub mod atr;
 pub mod codec;
 pub mod compat;
+pub mod factory;
 pub mod misc;
 pub mod policy;
 pub mod radio_ctrl;
@@ -72,6 +73,7 @@ pub mod time_core;
 pub use atr::{AtrMode, AtrOffsets, AtrReg, AtrStates, GpioAtr, Side};
 pub use codec::client_params;
 pub use compat::{CoreRegs, FpgaCompat, FpgaShim, FullShim, MiniShim, RadioRegs, RefLock};
+pub use factory::{B200Factory, find, register};
 pub use misc::{MiscGpio, RefSel, RxBand, TxBand};
 pub use policy::{
     DeviceCompat, Diagnosis, FoundFpga, ImageCandidate, ImageCatalog, ImageKind, Reload, Trouble,

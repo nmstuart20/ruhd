@@ -274,10 +274,9 @@ fn main() -> ExitCode {
 }
 
 /// Registers every backend compiled into this binary.
-///
-/// Empty until `uhd-b200` gains a factory; at that point this becomes
-/// `uhd_b200::register();` and nothing else in the CLI changes.
-fn register_backends() {}
+fn register_backends() {
+    uhd_b200::register();
+}
 
 fn run(command: &Command) -> Result<()> {
     debug!(?command, backends = ?registry::registered_types(), "dispatching");
