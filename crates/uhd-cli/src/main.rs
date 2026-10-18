@@ -1,6 +1,7 @@
 //! `ruhd` — command-line front end, the rough equivalent of `uhd_find_devices`,
 //! `uhd_usrp_probe` and `uhd_images_downloader`.
 
+mod benchmark;
 mod images;
 mod rx;
 
@@ -88,6 +89,16 @@ enum Command {
     /// layout UHD's `rx_samples_to_file` writes. Build with `--release` for
     /// sample rates above a few MS/s.
     Rx(rx::RxArgs),
+    /// Measure receive streaming throughput, like UHD's `benchmark_rate`.
+    ///
+    /// Streams at `--rx-rate` for `--duration` seconds into a buffer that is
+    /// thrown away, and prints `benchmark_rate`'s summary: samples received,
+    /// overruns, sequence errors, dropped samples, late commands and
+    /// timeouts. Exits non-zero if `--overrun-threshold` or
+    /// `--drop-threshold` is exceeded. Receive only for now. Build with
+    /// `--release`.
+    #[command(alias = "benchmark_rate", alias = "benchmark-rate")]
+    Benchmark(benchmark::BenchmarkArgs),
     /// Fetch and inspect the UHD images package.
     Images {
         #[command(subcommand)]
@@ -272,8 +283,13 @@ fn main() -> ExitCode {
 
     register_backends();
 
-    match run(&cli.command) {
-        Ok(()) => ExitCode::SUCCESS,
+    let result = match &cli.command {
+        // The only command whose exit status carries a verdict of its own.
+        Command::Benchmark(args) => benchmark::run(args),
+        command => run(command).map(|()| ExitCode::SUCCESS),
+    };
+    match result {
+        Ok(code) => code,
         Err(e) => {
             eprintln!("error: {e}");
             ExitCode::FAILURE
@@ -299,6 +315,7 @@ fn run(command: &Command) -> Result<()> {
         Command::Doctor(args) => doctor(args),
         Command::Reset { serial } => reset(serial.as_deref()),
         Command::Rx(args) => rx::run(args),
+        Command::Benchmark(args) => benchmark::run(args).map(|_| ()),
         Command::Images { action } => match action {
             ImagesAction::Status => images_status(),
             ImagesAction::Download(args) => images_download(args),

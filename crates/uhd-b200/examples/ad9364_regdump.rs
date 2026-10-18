@@ -9,7 +9,7 @@
 //!   --mode init --rate 16000000 --rx-freq 2450000000 --tx-freq 2450000000 \
 //!   --rx-gain 37 --tx-gain 10 --bandwidth 16000000
 //! ```
-//! 
+//!
 //! As a note, ruhd reports the actual frequency representable by the AD9364's fractional-N PLL
 //! So when requesting 2.45 GHz, that lies exactly halfway between two synthesizable LO frequencies
 //! 2,449,999,998.808 Hz

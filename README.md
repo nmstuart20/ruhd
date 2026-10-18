@@ -108,6 +108,21 @@ Overflows print `O` and sequence gaps `D`, as in UHD, and are counted at the
 end. On the bench B205mini over USB 3 a recording runs clean to disk at the
 AD9364's full 61.44 MS/s.
 
+## Benchmarking throughput
+
+```sh
+just bench --rx-rate 61.44e6 --duration 10
+just bench --rx-rate 10e6 --rx-cpu sc16 --overrun-threshold 0   # fail on any overrun
+```
+
+`ruhd benchmark` is the receive half of UHD's `benchmark_rate`: it streams
+into a buffer that is thrown away and prints the same summary block, plus the
+receive rate it actually achieved. The options take UHD's names too
+(`--rx_rate`, `--rx_spp`, `--rx_spb`, `--rx_cpu`, `--rx_delay`, `--random`,
+`--overrun-threshold`, `--drop-threshold`), and the command answers to
+`benchmark_rate` as well. Transmit is not implemented yet, so the TX lines are
+always zero; `--priority` and multi-channel options are not supported.
+
 ## Bringing a device up
 
 ```sh

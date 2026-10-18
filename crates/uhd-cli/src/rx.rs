@@ -77,7 +77,7 @@ pub(crate) struct RxArgs {
 
 /// Sample type written to the file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-enum FileType {
+pub(crate) enum FileType {
     /// Complex 16-bit integers. UHD's `short`.
     #[value(alias = "short")]
     Sc16,
@@ -90,7 +90,7 @@ enum FileType {
 }
 
 impl FileType {
-    fn format(self) -> SampleFormat {
+    pub(crate) fn format(self) -> SampleFormat {
         match self {
             Self::Sc16 => SampleFormat::Sc16,
             Self::Fc32 => SampleFormat::Fc32,

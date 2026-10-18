@@ -85,6 +85,10 @@ cli *ARGS:
 rx *ARGS:
     cargo run --release --bin ruhd -- rx {{ARGS}}
 
+# Receive throughput benchmark (release build), e.g. `just bench --rx-rate 61.44e6 --duration 10`.
+bench *ARGS:
+    cargo run --release --bin ruhd -- benchmark {{ARGS}}
+
 # Fetch the pinned UHD reference checkout (see NOTES.md).
 reference:
     git submodule update --init --depth 1 reference/uhd
