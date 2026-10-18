@@ -94,6 +94,8 @@ from, are documented in `uhd_transport::usb` (`just doc-open`).
 just cli init                                   # once per plug-in
 just rx --freq 98e6 --rate 8e6 --gain 40 --duration 2 --file fm.sc16
 just rx --freq 2.45e9 --rate 20e6 --nsamps 10000000 --type fc32 --file wifi.fc32
+just rx --freq 433.92e6 --rate 2e6 --file ism.sigmf-data   # until Ctrl-C
+just rx --freq 98e6 --rate 2e6 --duration 10 --file - | csdr ...   # to stdout
 ```
 
 `just rx` is `ruhd rx` built with `--release`, because a debug build cannot
@@ -104,8 +106,23 @@ that reads those reads these: `numpy.fromfile(f, dtype=numpy.int16)` for
 `--ant RX2|TX/RX`, `--master-clock-rate` (chosen from `--rate` the way UHD does
 if omitted), `--spp`, `--num-recv-frames`, `--serial`.
 
+With neither `--duration` nor `--nsamps`, recording runs until Ctrl-C, which
+stops the stream cleanly and keeps everything recorded; a second Ctrl-C exits
+at once. `--file -` writes samples to stdout (all messages go to stderr), and a
+reader that closes the pipe ends the recording normally.
+
+Each recording gets a [SigMF](https://sigmf.org) metadata file: the data
+file's name with its extension replaced by `.sigmf-meta`. It carries the sample
+format, rate, frequency, start time and hardware, with gain, bandwidth,
+antenna, master clock and the device time of the first sample under a `ruhd:`
+extension. Name the data file `*.sigmf-data` and SigMF tools pick the pair up
+directly. `--meta PATH` puts the metadata elsewhere (it is the only way to get
+it with `--file -`) and `--no-meta` turns it off.
+
 Overflows print `O` and sequence gaps `D`, as in UHD, and are counted at the
-end. On the bench B205mini over USB 3 a recording runs clean to disk at the
+end. Unlike UHD, each one is also recorded as a SigMF annotation at the sample
+index where the discontinuity falls, so you know which parts of a capture to
+distrust. On the bench B205mini over USB 3 a recording runs clean to disk at the
 AD9364's full 61.44 MS/s.
 
 ## Benchmarking throughput

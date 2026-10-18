@@ -24,6 +24,7 @@ uhd-transport = { path = "crates/uhd-transport", version = "0.1.0" }
 # External crates. Pinned here so every crate in the workspace agrees.
 bytemuck = "1.19"
 clap = { version = "4.5", features = ["derive"] }
+ctrlc = "3.5"
 num-complex = { version = "0.4.6", features = ["bytemuck"] }
 nusb = "0.2.7"
 thiserror = "2.0"

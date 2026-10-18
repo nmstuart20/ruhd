@@ -1,11 +1,18 @@
 //! `ruhd rx`: record IQ samples to a file, the rough equivalent of UHD's
 //! `rx_samples_to_file`.
+//!
+//! Beyond what UHD's tool does: Ctrl-C stops the stream cleanly and keeps
+//! what was recorded, the recording gets a SigMF metadata file with every
+//! overflow marked at the sample where it happened, and `--file -` streams to
+//! stdout for piping into other tools.
 
 use std::fs::File;
-use std::io::Write;
-use std::path::PathBuf;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use ad936x::{Chain, Direction};
 use clap::{Args, ValueEnum};
@@ -13,6 +20,8 @@ use uhd_b200::{OpenOptions, RxAntenna, RxOptions};
 use uhd_core::metadata::{RxError, RxMetadata};
 use uhd_core::stream::{RawRxStreamer, StreamArgs, StreamCmd};
 use uhd_core::{Error, Result, SampleFormat};
+
+use crate::sigmf::{self, Event, EventKind, Recording};
 
 /// How long the first samples may take to arrive after the stream starts.
 const FIRST_TIMEOUT: Duration = Duration::from_secs(1);
@@ -27,10 +36,20 @@ const BLOCKS: usize = 32;
 
 #[derive(Debug, Args)]
 pub(crate) struct RxArgs {
-    /// Output file. Samples are interleaved I/Q in host byte order with no
-    /// header, the same layout `rx_samples_to_file` writes.
+    /// Output file, or `-` for stdout. Samples are interleaved I/Q in host
+    /// byte order with no header, the same layout `rx_samples_to_file`
+    /// writes. A SigMF metadata file is written beside it; name the data file
+    /// `*.sigmf-data` so SigMF tools pair the two.
     #[arg(long, short)]
     file: PathBuf,
+    /// Where to write the SigMF metadata. Defaults to the data file with its
+    /// extension replaced by `.sigmf-meta`; with `--file -` there is no
+    /// default, and metadata is only written if this is given.
+    #[arg(long, conflicts_with = "no_meta")]
+    meta: Option<PathBuf>,
+    /// Do not write a SigMF metadata file.
+    #[arg(long)]
+    no_meta: bool,
     /// RF centre frequency, in Hz.
     #[arg(long)]
     freq: f64,
@@ -53,8 +72,9 @@ pub(crate) struct RxArgs {
     /// Number of samples to record.
     #[arg(long, conflicts_with = "duration")]
     nsamps: Option<u64>,
-    /// Seconds to record.
-    #[arg(long, required_unless_present = "nsamps")]
+    /// Seconds to record. With neither this nor `--nsamps`, records until
+    /// Ctrl-C.
+    #[arg(long)]
     duration: Option<f64>,
     /// Sample type in the file.
     #[arg(long = "type", value_enum, default_value_t = FileType::Sc16)]
@@ -110,9 +130,63 @@ struct Tally {
     overflows: u64,
     gaps: u64,
     bad_packets: u64,
+    /// Every discontinuity, in the order they happened.
+    events: Vec<Event>,
+    /// Device time of the first sample, in seconds.
+    first_device_time: Option<f64>,
+    /// Host time the stream was started.
+    started: Option<SystemTime>,
+    /// The reader at the other end of the output went away.
+    output_closed: bool,
+}
+
+impl Tally {
+    fn discontinuities(&self) -> u64 {
+        self.overflows + self.gaps + self.bad_packets
+    }
+}
+
+/// Whether the output is stdout rather than a file.
+fn is_stdout(path: &Path) -> bool {
+    path.as_os_str() == "-"
+}
+
+/// Installs a Ctrl-C handler that asks the receive loop to stop.
+///
+/// The first Ctrl-C stops the stream at the next block and keeps everything
+/// recorded so far. A second one exits at once, for a device that has stopped
+/// answering.
+fn stop_on_ctrl_c() -> Result<Arc<AtomicBool>> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&stop);
+    ctrlc::set_handler(move || {
+        if flag.swap(true, Ordering::SeqCst) {
+            eprintln!("\nInterrupted again; exiting without cleaning up.");
+            std::process::exit(130);
+        }
+        eprintln!("\nStopping (Ctrl-C again to exit at once)...");
+    })
+    .map_err(|e| Error::Internal(format!("installing the Ctrl-C handler: {e}")))?;
+    Ok(stop)
 }
 
 pub(crate) fn run(args: &RxArgs) -> Result<()> {
+    // Checked before the device is touched, so a typo costs nothing.
+    if let Some(secs) = args.duration
+        && !(secs.is_finite() && secs > 0.0)
+    {
+        return Err(Error::invalid_arg(format!(
+            "--duration must be a positive number of seconds, not {secs}"
+        )));
+    }
+    let meta_path = match (&args.meta, args.no_meta) {
+        (_, true) => None,
+        (Some(path), false) => Some(path.clone()),
+        (None, false) if is_stdout(&args.file) => None,
+        (None, false) => Some(sigmf::meta_path_for(&args.file)),
+    };
+    let stop = stop_on_ctrl_c()?;
+
     let mut open_options = OpenOptions::new();
     if let Some(serial) = &args.serial {
         open_options = open_options.with_serial(serial);
@@ -185,46 +259,99 @@ pub(crate) fn run(args: &RxArgs) -> Result<()> {
     }
 
     let total = match (args.nsamps, args.duration) {
-        (Some(n), _) => n,
-        (None, Some(secs)) if secs.is_finite() && secs > 0.0 => (secs * rate).round() as u64,
-        (None, duration) => {
-            return Err(Error::invalid_arg(format!(
-                "--duration must be a positive number of seconds, not {duration:?}"
-            )));
-        }
+        (Some(n), _) => Some(n),
+        (None, Some(secs)) => Some((secs * rate).round() as u64),
+        (None, None) => None,
     };
+    if total.is_none() {
+        eprintln!("Recording until Ctrl-C.");
+    }
 
-    let file = File::create(&args.file)?;
-    let tally = record(&mut rx, file, total)?;
+    let out: Box<dyn Write + Send> = if is_stdout(&args.file) {
+        Box::new(io::stdout())
+    } else {
+        Box::new(File::create(&args.file)?)
+    };
+    let mut tally = Tally::default();
+    let result = record(&mut rx, out, total, &stop, &mut tally);
+    let antenna = rx.antenna().to_string();
     drop(rx);
 
+    let target = if is_stdout(&args.file) {
+        "stdout".to_string()
+    } else {
+        args.file.display().to_string()
+    };
     let bytes = tally.samples * (args.file_type.format().bits_per_sample() / 8) as u64;
     eprintln!(
-        "Wrote {} samples ({:.1} MB) to {}",
+        "Wrote {} samples ({:.1} MB) to {target}",
         tally.samples,
         bytes as f64 / 1e6,
-        args.file.display()
     );
-    if tally.overflows + tally.gaps + tally.bad_packets > 0 {
+    if tally.output_closed {
+        eprintln!("  stopped because the reader closed the output");
+    }
+    if tally.discontinuities() > 0 {
         eprintln!(
             "  {} overflow(s), {} sequence gap(s), {} bad packet(s); the file has \
              discontinuities",
             tally.overflows, tally.gaps, tally.bad_packets
         );
     }
-    Ok(())
+
+    // Written even when the stream failed part-way, so the samples that did
+    // land on disk are still described.
+    if let (Some(path), Some(started)) = (meta_path, tally.started) {
+        let hardware = match &session.endpoint().serial {
+            Some(serial) => format!("{} {serial}", session.product()),
+            None => session.product().to_string(),
+        };
+        let recording = Recording {
+            format: args.file_type.format(),
+            sample_rate: rate,
+            frequency: freq,
+            gain,
+            bandwidth: bw,
+            antenna,
+            master_clock_rate: tick_rate,
+            hardware,
+            started,
+            first_device_time: tally.first_device_time,
+            events: std::mem::take(&mut tally.events),
+        };
+        let text = serde_json::to_string_pretty(&sigmf::metadata(&recording))
+            .map_err(|e| Error::Internal(format!("encoding SigMF metadata: {e}")))?;
+        std::fs::write(&path, text + "\n")?;
+        eprintln!("  metadata: {}", path.display());
+        if !is_stdout(&args.file)
+            && args.meta.is_none()
+            && args.file.extension().is_none_or(|ext| ext != "sigmf-data")
+        {
+            eprintln!(
+                "  note: SigMF tools expect the data file to be named {}",
+                path.with_extension("sigmf-data").display()
+            );
+        }
+    }
+    result
 }
 
-/// Streams until `total` samples are written.
+/// Streams until `total` samples are written, `stop` is set, or the reader
+/// at the other end of `out` goes away.
 ///
 /// The file is written on its own thread, so a slow write delays only that
 /// thread: the receive loop keeps draining USB until every block in the pool
 /// is waiting on the disk.
+///
+/// `tally` is filled in as the stream runs rather than returned, so a caller
+/// still knows what was recorded when this fails part-way.
 fn record(
     rx: &mut dyn RawRxStreamer,
-    out: impl Write + Send + 'static,
-    total: u64,
-) -> Result<Tally> {
+    out: Box<dyn Write + Send>,
+    total: Option<u64>,
+    stop: &AtomicBool,
+    tally: &mut Tally,
+) -> Result<()> {
     let host_bytes = rx.host_format().bits_per_sample() / 8;
     let block_samples = BLOCK_BYTES / host_bytes;
 
@@ -235,7 +362,7 @@ fn record(
             .send(vec![0u8; block_samples * host_bytes])
             .map_err(|_| Error::Internal("block pool closed".into()))?;
     }
-    let writer = std::thread::spawn(move || -> std::io::Result<()> {
+    let writer = std::thread::spawn(move || -> io::Result<()> {
         let mut out = out;
         for (block, len) in full_rx {
             out.write_all(&block[..len])?;
@@ -245,87 +372,68 @@ fn record(
         out.flush()
     });
 
-    let result = stream_blocks(rx, total, block_samples, host_bytes, &empty_rx, &full_tx);
+    let result = stream_blocks(
+        rx,
+        total,
+        stop,
+        block_samples,
+        host_bytes,
+        &empty_rx,
+        &full_tx,
+        tally,
+    );
     drop(full_tx);
     let written = writer
         .join()
         .map_err(|_| Error::Internal("the file writer thread panicked".into()))?;
-    let tally = result?;
-    written?;
-    Ok(tally)
+    match written {
+        // A pipe whose reader exits (`ruhd rx -f - | head -c 1M`) is a normal
+        // way for a recording to end, not a failure. The receive loop will
+        // have stopped on the closed pool; that error is the same event.
+        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {
+            tally.output_closed = true;
+            Ok(())
+        }
+        Err(e) => {
+            result?;
+            Err(e.into())
+        }
+        Ok(()) => result,
+    }
 }
 
-/// The receive half of [`record`]: fills blocks from the pool and hands them
-/// to the writer.
+/// The receive half of [`record`]: starts the stream, runs it, and stops it
+/// again however the run ended.
+#[allow(clippy::too_many_arguments)]
 fn stream_blocks(
     rx: &mut dyn RawRxStreamer,
-    total: u64,
+    total: Option<u64>,
+    stop: &AtomicBool,
     block_samples: usize,
     host_bytes: usize,
     empty: &mpsc::Receiver<Vec<u8>>,
     full: &mpsc::Sender<(Vec<u8>, usize)>,
-) -> Result<Tally> {
-    let mut md = RxMetadata::default();
-    let mut tally = Tally::default();
-    let closed = || Error::Internal("the file writer stopped early".into());
-
-    rx.issue_stream_cmd(&StreamCmd::start_continuous())?;
-    let started = Instant::now();
-    let mut timeout = FIRST_TIMEOUT;
-    let mut first = true;
-    let mut block = empty.recv().map_err(|_| closed())?;
-    let mut filled = 0usize;
-
-    while tally.samples < total {
-        let room = (block_samples - filled).min((total - tally.samples) as usize);
-        let n = rx.recv_raw(
-            &mut [&mut block[filled * host_bytes..(filled + room) * host_bytes]],
-            timeout,
-            &mut md,
-        )?;
-        match md.error {
-            None => {}
-            Some(RxError::Overflow) if md.out_of_sequence => {
-                tally.gaps += 1;
-                eprint!("D");
-            }
-            Some(RxError::Overflow) => {
-                tally.overflows += 1;
-                eprint!("O");
-            }
-            Some(RxError::BadPacket) => tally.bad_packets += 1,
-            Some(RxError::Timeout) => {
-                rx.issue_stream_cmd(&StreamCmd::stop()).ok();
-                return Err(Error::Timeout(timeout));
-            }
-            Some(other) => {
-                rx.issue_stream_cmd(&StreamCmd::stop()).ok();
-                return Err(Error::Device(format!("receive stream error: {other:?}")));
-            }
-        }
-        if n > 0 && first {
-            first = false;
-            timeout = RUNNING_TIMEOUT;
-            if let Some(time) = md.time_spec {
-                eprintln!("  first sample: device time {:.9} s", time.as_secs_f64());
-            }
-        }
-        filled += n;
-        tally.samples += n as u64;
-        if filled == block_samples || tally.samples == total {
-            full.send((block, filled * host_bytes))
-                .map_err(|_| closed())?;
-            filled = 0;
-            if tally.samples < total {
-                block = empty.recv().map_err(|_| closed())?;
-            } else {
-                block = Vec::new();
-            }
-        }
+    tally: &mut Tally,
+) -> Result<()> {
+    if stop.load(Ordering::SeqCst) {
+        return Ok(());
     }
-    drop(block);
+    rx.issue_stream_cmd(&StreamCmd::start_continuous())?;
+    tally.started = Some(SystemTime::now());
+    let started = Instant::now();
 
-    rx.issue_stream_cmd(&StreamCmd::stop())?;
+    let result = pump(
+        rx,
+        total,
+        stop,
+        block_samples,
+        host_bytes,
+        empty,
+        full,
+        tally,
+    );
+    let stopped = rx.issue_stream_cmd(&StreamCmd::stop());
+
     let elapsed = started.elapsed().as_secs_f64();
     if tally.overflows + tally.gaps > 0 {
         eprintln!();
@@ -334,5 +442,89 @@ fn stream_blocks(
         "  streamed for {elapsed:.2} s ({:.3} MS/s average)",
         tally.samples as f64 / elapsed / 1e6
     );
-    Ok(tally)
+    result?;
+    stopped
+}
+
+/// Fills blocks from the pool and hands them to the writer.
+#[allow(clippy::too_many_arguments)]
+fn pump(
+    rx: &mut dyn RawRxStreamer,
+    total: Option<u64>,
+    stop: &AtomicBool,
+    block_samples: usize,
+    host_bytes: usize,
+    empty: &mpsc::Receiver<Vec<u8>>,
+    full: &mpsc::Sender<(Vec<u8>, usize)>,
+    tally: &mut Tally,
+) -> Result<()> {
+    let mut md = RxMetadata::default();
+    let closed = || Error::Internal("the file writer stopped early".into());
+    let remaining = |tally: &Tally| total.map_or(u64::MAX, |t| t - tally.samples);
+
+    let mut timeout = FIRST_TIMEOUT;
+    let mut first = true;
+    let mut block = empty.recv().map_err(|_| closed())?;
+    let mut filled = 0usize;
+
+    while remaining(tally) > 0 && !stop.load(Ordering::SeqCst) {
+        let room =
+            (block_samples - filled).min(usize::try_from(remaining(tally)).unwrap_or(usize::MAX));
+        let n = rx.recv_raw(
+            &mut [&mut block[filled * host_bytes..(filled + room) * host_bytes]],
+            timeout,
+            &mut md,
+        )?;
+        let kind = match md.error {
+            None => None,
+            Some(RxError::Overflow) if md.out_of_sequence => {
+                tally.gaps += 1;
+                eprint!("D");
+                Some(EventKind::SequenceGap)
+            }
+            Some(RxError::Overflow) => {
+                tally.overflows += 1;
+                eprint!("O");
+                Some(EventKind::Overflow)
+            }
+            Some(RxError::BadPacket) => {
+                tally.bad_packets += 1;
+                Some(EventKind::BadPacket)
+            }
+            Some(RxError::Timeout) => return Err(Error::Timeout(timeout)),
+            Some(other) => {
+                return Err(Error::Device(format!("receive stream error: {other:?}")));
+            }
+        };
+        if let Some(kind) = kind {
+            // The discontinuity is before this call's samples, so it falls at
+            // the count written so far.
+            tally.events.push(Event {
+                sample: tally.samples,
+                kind,
+                device_time: md.time_spec.map(|t| t.as_secs_f64()),
+            });
+        }
+        if n > 0 && first {
+            first = false;
+            timeout = RUNNING_TIMEOUT;
+            if let Some(time) = md.time_spec {
+                tally.first_device_time = Some(time.as_secs_f64());
+                eprintln!("  first sample: device time {:.9} s", time.as_secs_f64());
+            }
+        }
+        filled += n;
+        tally.samples += n as u64;
+        if filled == block_samples {
+            full.send((block, filled * host_bytes))
+                .map_err(|_| closed())?;
+            filled = 0;
+            block = empty.recv().map_err(|_| closed())?;
+        }
+    }
+    if filled > 0 {
+        full.send((block, filled * host_bytes))
+            .map_err(|_| closed())?;
+    }
+    Ok(())
 }

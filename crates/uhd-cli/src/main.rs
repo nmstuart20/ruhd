@@ -4,6 +4,7 @@
 mod benchmark;
 mod images;
 mod rx;
+mod sigmf;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -273,10 +274,17 @@ fn parse_hex_u16(s: &str) -> std::result::Result<u16, String> {
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
+    // nusb warns about any device whose sysfs entry vanishes mid-scan. That
+    // happens on every firmware load or reset, because the bus is polled while
+    // the old device is being torn down, and the device it skips is the one
+    // that is leaving. `RUST_LOG` still shows it.
+    let default_filter = format!(
+        "{},nusb::platform::linux_usbfs::enumeration=error",
+        cli.log_level
+    );
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new(cli.log_level.clone())),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter)),
         )
         .with_writer(std::io::stderr)
         .init();
