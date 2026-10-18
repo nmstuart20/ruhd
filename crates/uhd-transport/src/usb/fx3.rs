@@ -255,19 +255,15 @@ impl Fx3Iface {
     /// # Errors
     ///
     /// [`Error::Usb`] if the device cannot be opened — no permission (see the
-    /// udev section in [the module docs](super)), already claimed, or gone
+    /// [udev section](super#udev-rules-for-non-root-access) of the module
+    /// docs), already claimed, or gone
     /// since it was probed.
     pub fn open(probe: &UsbProbe) -> Result<Self> {
-        let device = probe.device_info().open().wait().map_err(|e| {
-            if e.kind() == nusb::ErrorKind::PermissionDenied {
-                Error::Usb(format!(
-                    "permission denied opening {}; install the udev rules for non-root access",
-                    probe.endpoint
-                ))
-            } else {
-                Error::Usb(format!("cannot open {}: {e}", probe.endpoint))
-            }
-        })?;
+        let device = probe
+            .device_info()
+            .open()
+            .wait()
+            .map_err(|e| probe.open_error(&e))?;
         Ok(Self {
             device,
             endpoint: probe.endpoint.clone(),

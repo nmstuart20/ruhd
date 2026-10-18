@@ -241,22 +241,43 @@ impl UsbProbe {
     /// On Linux, enumeration reads sysfs and always succeeds, but opening goes
     /// through `/dev/bus/usb`, which is root-only unless udev has been told
     /// otherwise. So a device can be listed in full detail and still be
-    /// unusable, and this is the call that says which. See the udev section in
-    /// [the module docs](super) for the fix; the error carries a pointer to it.
+    /// unusable, and this is the call that says which. The error names the
+    /// fix; see also [the module docs](super#udev-rules-for-non-root-access).
     ///
     /// # Errors
     ///
     /// [`Error::Usb`] if the device cannot be opened — no permission, already
     /// claimed by another process, or unplugged since it was probed.
     pub fn check_access(&self) -> Result<()> {
-        match self.info.open().wait() {
-            Ok(_device) => Ok(()),
-            Err(e) if e.kind() == nusb::ErrorKind::PermissionDenied => Err(Error::Usb(format!(
-                "permission denied opening {}; install the udev rules for non-root access",
-                self.endpoint
-            ))),
-            Err(e) => Err(Error::Usb(format!("cannot open {}: {e}", self.endpoint))),
+        self.info
+            .open()
+            .wait()
+            .map(drop)
+            .map_err(|e| self.open_error(&e))
+    }
+
+    /// Turns a failed open into an error that says what to do about it.
+    ///
+    /// Permission denied is the common first-run failure, so it names the
+    /// rules file and the recipe that installs it. A board in the FX3
+    /// bootloader gets the opt-in bootloader rule instead, because the normal
+    /// rules (UHD's included) do not cover that VID/PID.
+    pub(crate) fn open_error(&self, e: &nusb::Error) -> Error {
+        if e.kind() != nusb::ErrorKind::PermissionDenied {
+            return Error::Usb(format!("cannot open {}: {e}", self.endpoint));
         }
+        let fix = if FX3_BOOTLOADER_VID_PIDS.contains(&(self.vid(), self.pid())) {
+            "this board is in the Cypress FX3 bootloader, which the usual udev rules \
+             do not cover; run `just udev-install-bootloader` (udev/61-ruhd-fx3-bootloader.rules) \
+             or use sudo"
+        } else {
+            "install the udev rules with `just udev-install` (udev/60-ruhd-b2xx.rules), \
+             then replug; over SSH also join the usrp group. See \"USB permissions\" in README.md"
+        };
+        Error::Usb(format!(
+            "permission denied opening {}; {fix}",
+            self.endpoint
+        ))
     }
 }
 

@@ -415,10 +415,7 @@ fn probe_usb(args: &UsbProbeArgs) -> Result<()> {
         if !args.no_access_check {
             match device.check_access() {
                 Ok(()) => println!("  access:  ok"),
-                Err(e) => {
-                    println!("  access:  {e}");
-                    println!("           see the udev section in README.md");
-                }
+                Err(e) => println!("  access:  {e}"),
             }
         }
 

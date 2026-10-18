@@ -1,0 +1,41 @@
+# udev rules: let ordinary users open USRP B2xx devices.
+#
+# Install with `just udev-install`, then replug the board. See "USB
+# permissions" in README.md. Not needed if your distro's UHD package already
+# installed its own rule (usually /usr/lib/udev/rules.d/10-usrp-uhd.rules).
+#
+# Each rule grants access two ways:
+#
+#   TAG+="uaccess", ENV{ID_SOFTWARE_RADIO}="1"
+#       systemd-logind gives the user logged in at the local seat (the desktop)
+#       read/write access. Nothing to configure, but it does not apply to SSH,
+#       headless or service logins. ID_SOFTWARE_RADIO is what UHD's own rule
+#       sets; the tag does the same thing directly on older systemd.
+#
+#   GROUP="usrp", MODE="0660"
+#       Members of the `usrp` group get access from anywhere. This is the one
+#       for remote and headless machines: `sudo usermod -aG usrp $USER`, then
+#       log in again. If the group does not exist udev logs a warning and the
+#       seat access above still works.
+#
+# The file is numbered below 70 so the tag is set before systemd's
+# 70-uaccess.rules and 73-seat-late.rules act on it.
+
+ACTION!="add|change", GOTO="ruhd_b2xx_end"
+SUBSYSTEM!="usb", GOTO="ruhd_b2xx_end"
+ENV{DEVTYPE}!="usb_device", GOTO="ruhd_b2xx_end"
+
+# B200 / B210 (shared PID; the EEPROM tells them apart)
+ATTR{idVendor}=="2500", ATTR{idProduct}=="0020", GROUP="usrp", MODE="0660", TAG+="uaccess", ENV{ID_SOFTWARE_RADIO}="1"
+# B200mini
+ATTR{idVendor}=="2500", ATTR{idProduct}=="0021", GROUP="usrp", MODE="0660", TAG+="uaccess", ENV{ID_SOFTWARE_RADIO}="1"
+# B205mini
+ATTR{idVendor}=="2500", ATTR{idProduct}=="0022", GROUP="usrp", MODE="0660", TAG+="uaccess", ENV{ID_SOFTWARE_RADIO}="1"
+# B206mini
+ATTR{idVendor}=="2500", ATTR{idProduct}=="0023", GROUP="usrp", MODE="0660", TAG+="uaccess", ENV{ID_SOFTWARE_RADIO}="1"
+# NI USRP-2900 (B200)
+ATTR{idVendor}=="3923", ATTR{idProduct}=="7813", GROUP="usrp", MODE="0660", TAG+="uaccess", ENV{ID_SOFTWARE_RADIO}="1"
+# NI USRP-2901 (B210)
+ATTR{idVendor}=="3923", ATTR{idProduct}=="7814", GROUP="usrp", MODE="0660", TAG+="uaccess", ENV{ID_SOFTWARE_RADIO}="1"
+
+LABEL="ruhd_b2xx_end"

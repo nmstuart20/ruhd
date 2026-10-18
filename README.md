@@ -36,6 +36,10 @@ just cli find
 `just` with no arguments lists every target. If you do not have [just][just],
 the underlying commands are plain `cargo build` / `cargo test` / `cargo clippy`.
 
+To talk to a board on Linux without `sudo` you need a udev rule. Run `just cli
+probe usb`: if it reports `access: ok` you are already set; otherwise see
+[USB permissions](#usb-permissions-udev-rules).
+
 The UHD C++ sources are vendored as a read-only submodule for reference:
 
 ```sh
@@ -326,45 +330,72 @@ bypass all of it, for locally built images.
 
 ## USB permissions (udev rules)
 
-On Linux, listing a device works for any user, but *opening* one goes through
-`/dev/bus/usb/…`, which is root-only by default. The symptom is a device that
-shows up in full detail with `access: permission denied` against it.
+On Linux, any user can *list* a USB device, but *opening* one goes through
+`/dev/bus/usb/…`, which only root can write to unless a udev rule says
+otherwise. Without one, `init`, `rx` and `reset` fail, `find` skips the board
+with a warning, and the tempting workaround, `sudo cargo run`, leaves
+root-owned files in `target/` and puts the images cache in root's home.
 
-The fix is a udev rule. UHD ships one, and it is in the reference checkout:
+**Check first. You may already be set up.**
 
 ```sh
-sudo cp reference/uhd/host/utils/uhd-usrp.rules /etc/udev/rules.d/10-usrp.rules
+just cli probe usb
+```
+
+If the device shows `access:  ok`, there is nothing to do. That is common:
+distro UHD packages (Fedora, EPEL, Debian/Ubuntu `libuhd`) install their own
+rule, usually `/usr/lib/udev/rules.d/10-usrp-uhd.rules`. If it shows
+`permission denied`, install ruhd's rules:
+
+```sh
+just udev-install        # copies udev/60-ruhd-b2xx.rules, reloads udev
+```
+
+Then **replug the board.** udev applies rules when a device appears, and the
+recipe's `udevadm trigger` does not always reach a board that is already
+attached. Without `just`, the recipe is:
+
+```sh
+sudo groupadd --system --force usrp
+sudo install -m 0644 udev/60-ruhd-b2xx.rules /etc/udev/rules.d/
 sudo udevadm control --reload-rules
-sudo udevadm trigger
+sudo udevadm trigger --subsystem-match=usb
 ```
 
-Then **replug the device** — udev sets permissions when a device appears, so an
-already-attached board keeps whatever it was given at plug-in time.
+### How access is granted, and when it is not
 
-If you do not have the submodule, the B2xx lines of that file are:
+The rule (like UHD's packaged one) grants access two ways:
 
+- **Seat access.** systemd-logind gives the user logged in at the machine's
+  local seat (the desktop session) read/write access automatically. This is why
+  things usually just work on a workstation, even though you are not in any
+  special group.
+- **The `usrp` group.** Seat access does not apply over SSH, on a headless box,
+  or for a service or CI runner. There you need to join the group:
+
+  ```sh
+  sudo usermod -aG usrp $USER    # then log out and back in
+  ```
+
+So "it works on my desktop" and "it works over SSH" can have different answers
+on the same machine.
+
+### Blank boards (the FX3 bootloader)
+
+A board whose EEPROM is blank or erased enumerates as Cypress's generic FX3
+bootloader, `04b4:00f3` (or `04b4:00f0`), not as a USRP. No standard rule
+covers those IDs, UHD's included, so recovering such a board needs root even
+where everything else works. That is also why UHD documents `b2xx_fx3_utils`
+as a `sudo` tool. To recover blank boards as an ordinary user:
+
+```sh
+just udev-install-bootloader   # udev/61-ruhd-fx3-bootloader.rules
 ```
-#B200
-SUBSYSTEMS=="usb", ATTRS{idVendor}=="2500", ATTRS{idProduct}=="0020", MODE:="0666"
-SUBSYSTEMS=="usb", ATTRS{idVendor}=="2500", ATTRS{idProduct}=="0021", MODE:="0666"
-SUBSYSTEMS=="usb", ATTRS{idVendor}=="2500", ATTRS{idProduct}=="0022", MODE:="0666"
-SUBSYSTEMS=="usb", ATTRS{idVendor}=="2500", ATTRS{idProduct}=="0023", MODE:="0666"
-SUBSYSTEMS=="usb", ATTRS{idVendor}=="3923", ATTRS{idProduct}=="7813", MODE:="0666"
-SUBSYSTEMS=="usb", ATTRS{idVendor}=="3923", ATTRS{idProduct}=="7814", MODE:="0666"
-```
 
-Two things that file does not do, and one of them will eventually bite:
+This is opt-in because those IDs are not USRP-specific: the rule matches *any*
+FX3-based device on the machine while it is in its bootloader.
 
-- **It does not cover the Cypress bootloader**, `04b4:00f3`. A board in the
-  `uninitialized` state still needs root, which is why UHD's own
-  `b2xx_fx3_utils` is documented as a `sudo` tool. Add
-  `ATTRS{idVendor}=="04b4", ATTRS{idProduct}=="00f3"` (and `00f0`) if you expect
-  to recover blank boards as an ordinary user — bearing in mind that is
-  Cypress's generic bootloader ID, so it matches any FX3-based device on the
-  machine.
-- **`MODE:="0666"` is world-accessible.** Substituting
-  `MODE:="0660", GROUP:="usrp"` restricts it to a group, at the cost of having
-  to create the group and add yourself to it.
+`just udev-uninstall` removes both files.
 
 ## Licence
 

@@ -1,0 +1,23 @@
+# udev rules: let ordinary users open a B2xx stuck in the Cypress FX3
+# bootloader, i.e. a board whose EEPROM is blank or erased.
+#
+# Optional. Install with `just udev-install-bootloader`. Only needed to recover
+# such a board without sudo; a healthy B2xx never shows up under these IDs.
+#
+# Caution: 04b4:00f3 is Cypress's generic FX3 bootloader ID, not a USRP one.
+# These rules match ANY FX3-based device on the machine in that state. That is
+# why they live in their own file and are not installed by default.
+#
+# Access works the same way as 60-ruhd-b2xx.rules (seat access plus the
+# `usrp` group), minus ID_SOFTWARE_RADIO, since this may not be a radio at all.
+
+ACTION!="add|change", GOTO="ruhd_fx3_end"
+SUBSYSTEM!="usb", GOTO="ruhd_fx3_end"
+ENV{DEVTYPE}!="usb_device", GOTO="ruhd_fx3_end"
+
+# FX3 ROM bootloader
+ATTR{idVendor}=="04b4", ATTR{idProduct}=="00f3", GROUP="usrp", MODE="0660", TAG+="uaccess"
+# FX3 second-stage bootloader (after usrp_b200_bl.img is loaded)
+ATTR{idVendor}=="04b4", ATTR{idProduct}=="00f0", GROUP="usrp", MODE="0660", TAG+="uaccess"
+
+LABEL="ruhd_fx3_end"

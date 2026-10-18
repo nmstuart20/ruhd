@@ -70,54 +70,18 @@
 //! device goes through `/dev/bus/usb/…`, which is `root:root 0664` by default.
 //! The result is the confusing failure mode this module tries to make obvious:
 //! `probe` lists the device in full detail, and [`UsbProbe::check_access`] then
-//! reports permission denied.
+//! reports permission denied, with the fix in the message.
 //!
-//! The fix is a udev rule granting access to the relevant VID/PID pairs. UHD
-//! ships one as `host/utils/uhd-usrp.rules`; install it as
-//! `/etc/udev/rules.d/10-usrp.rules` and reload:
+//! The fix is a udev rule. The rules themselves live in the repository's
+//! `udev/` directory and the instructions in the README's "USB permissions"
+//! section, so that there is one copy of each. Two facts matter in code:
 //!
-//! ```text
-//! #B200
-//! SUBSYSTEMS=="usb", ATTRS{idVendor}=="2500", ATTRS{idProduct}=="0020", MODE:="0666"
-//! SUBSYSTEMS=="usb", ATTRS{idVendor}=="2500", ATTRS{idProduct}=="0021", MODE:="0666"
-//! SUBSYSTEMS=="usb", ATTRS{idVendor}=="2500", ATTRS{idProduct}=="0022", MODE:="0666"
-//! SUBSYSTEMS=="usb", ATTRS{idVendor}=="2500", ATTRS{idProduct}=="0023", MODE:="0666"
-//! SUBSYSTEMS=="usb", ATTRS{idVendor}=="3923", ATTRS{idProduct}=="7813", MODE:="0666"
-//! SUBSYSTEMS=="usb", ATTRS{idVendor}=="3923", ATTRS{idProduct}=="7814", MODE:="0666"
-//! ```
-//!
-//! ```sh
-//! sudo cp reference/uhd/host/utils/uhd-usrp.rules /etc/udev/rules.d/10-usrp.rules
-//! sudo udevadm control --reload-rules
-//! sudo udevadm trigger
-//! ```
-//!
-//! Then **replug the device**: udev applies rules when a device appears, so an
-//! already-attached B2xx keeps the permissions it was given at plug-in time.
-//!
-//! Two things about that file are worth knowing before it surprises you.
-//!
-//! It does not cover the Cypress bootloader, `04b4:00f3`. A board in
-//! [`DeviceState::Uninitialized`] therefore still needs root to talk to, which
-//! is why UHD's own `b2xx_fx3_utils` is documented as a `sudo` tool. If you
-//! expect to recover blank boards as an ordinary user, add:
-//!
-//! ```text
-//! #Cypress FX3 bootloader (uninitialized B2xx)
-//! SUBSYSTEMS=="usb", ATTRS{idVendor}=="04b4", ATTRS{idProduct}=="00f3", MODE:="0666"
-//! SUBSYSTEMS=="usb", ATTRS{idVendor}=="04b4", ATTRS{idProduct}=="00f0", MODE:="0666"
-//! ```
-//!
-//! Note that `04b4:00f3` is Cypress's generic bootloader ID, not a USRP one:
-//! any FX3-based device on the machine matches it. A tighter rule that grants
-//! access to a group rather than the world is the better shape if that matters:
-//!
-//! ```text
-//! SUBSYSTEMS=="usb", ATTRS{idVendor}=="2500", ATTRS{idProduct}=="0022", MODE:="0660", GROUP:="usrp"
-//! ```
-//!
-//! And `MODE:=` with the colon is deliberate in UHD's file — it makes the
-//! assignment final, so a later rule cannot take the permission away again.
+//! - A distro's UHD package often installs an equivalent rule already, so a
+//!   working `check_access` on one machine says nothing about the next.
+//! - No standard rule covers the Cypress bootloader IDs
+//!   ([`FX3_BOOTLOADER_VID_PIDS`]), so a board in
+//!   [`DeviceState::Uninitialized`] usually needs root even where everything
+//!   else works. The opt-in `udev/61-ruhd-fx3-bootloader.rules` covers it.
 //!
 //! # Bringing a device all the way up
 //!

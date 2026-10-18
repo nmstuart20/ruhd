@@ -89,6 +89,31 @@ rx *ARGS:
 bench *ARGS:
     cargo run --release --bin ruhd -- benchmark {{ARGS}}
 
+# Let B2xx devices open without sudo (Linux; asks for sudo, then replug). See README.
+udev-install: (_udev-install "60-ruhd-b2xx.rules")
+
+# Also allow blank boards in the FX3 bootloader. Opt-in: matches any FX3 device.
+udev-install-bootloader: (_udev-install "61-ruhd-fx3-bootloader.rules")
+
+# Remove the udev rules installed by udev-install and udev-install-bootloader.
+udev-uninstall:
+    sudo rm -f /etc/udev/rules.d/60-ruhd-b2xx.rules /etc/udev/rules.d/61-ruhd-fx3-bootloader.rules
+    sudo udevadm control --reload-rules
+
+_udev-install FILE:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    sudo groupadd --system --force usrp
+    sudo install -m 0644 "udev/{{FILE}}" /etc/udev/rules.d/
+    sudo udevadm control --reload-rules
+    sudo udevadm trigger --subsystem-match=usb
+    echo "installed /etc/udev/rules.d/{{FILE}}"
+    echo "now replug the board, then check with: just cli probe usb"
+    if ! id -nG | tr ' ' '\n' | grep -qx usrp; then
+        echo "using this machine over SSH or headless? also run:"
+        echo "  sudo usermod -aG usrp $USER   # then log in again"
+    fi
+
 # Fetch the pinned UHD reference checkout (see NOTES.md).
 reference:
     git submodule update --init --depth 1 reference/uhd
