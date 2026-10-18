@@ -111,6 +111,71 @@ stops the stream cleanly and keeps everything recorded; a second Ctrl-C exits
 at once. `--file -` writes samples to stdout (all messages go to stderr), and a
 reader that closes the pipe ends the recording normally.
 
+### Piping to other tools
+
+Because messages go to stderr, `--file -` can feed straight into anything that
+reads raw IQ on stdin. Some useful pipelines:
+
+**Listen to broadcast FM** with [csdr][csdr]. At 2.4 MS/s, decimating by 10 and
+then 5 lands on 48 kHz audio; `--type fc32` matches csdr's complex-float input,
+so no conversion step is needed:
+
+```sh
+just rx --freq 98.1e6 --rate 2.4e6 --gain 40 --type fc32 --file - \
+  | csdr fir_decimate_cc 10 0.05 HAMMING \
+  | csdr fmdemod_quadri_cf \
+  | csdr fractional_decimator_ff 5 \
+  | csdr deemphasis_wfm_ff 48000 50e-6 \
+  | csdr convert_f_s16 \
+  | aplay -f S16_LE -r 48000 -c 1
+```
+
+**Record and process at the same time** with `tee`, so a live pipeline does
+not cost you the capture:
+
+```sh
+just rx --freq 433.92e6 --rate 2e6 --file - --meta ism.sigmf-meta \
+  | tee ism.sigmf-data | my-decoder
+```
+
+**Compress on the fly.** Raw IQ is large (61.44 MS/s of `sc16` is about
+245 MB/s), and a fast `zstd` level usually keeps up while shrinking quiet
+bands a lot:
+
+```sh
+just rx --freq 2.45e9 --rate 20e6 --duration 30 --file - --meta wifi.sigmf-meta \
+  | zstd -1 -T0 -o wifi.sc16.zst
+zstd -dc wifi.sc16.zst > wifi.sigmf-data   # later, to get the raw file back
+```
+
+**Capture on a remote machine** with the radio attached, and write the
+samples locally:
+
+```sh
+ssh sdr-host 'ruhd rx --freq 1090e6 --rate 2e6 --duration 60 --file -' > adsb.sc16
+```
+
+The metadata flag, if any, is evaluated on the remote side, so `--meta` there
+writes the file there.
+
+**Inspect samples live in Python**, for example a running power meter. The
+script reads fixed-size blocks from stdin; when it exits, the closed pipe stops
+the recording cleanly:
+
+```sh
+just rx --freq 98.1e6 --rate 2e6 --type fc32 --file - | python3 -c '
+import sys, numpy as np
+n = 1 << 16
+while (buf := sys.stdin.buffer.read(n * 8)):
+    x = np.frombuffer(buf, dtype=np.complex64)
+    print(f"{10 * np.log10(np.mean(np.abs(x) ** 2) + 1e-20):7.2f} dBFS")
+'
+```
+
+Pipelines have no disk to buffer for them, so a consumer slower than the
+sample rate will cause overflows (`O` on stderr). Lower `--rate`, or put a
+buffer such as `mbuffer -m 1G` in front of the slow stage.
+
 Each recording gets a [SigMF](https://sigmf.org) metadata file: the data
 file's name with its extension replaced by `.sigmf-meta`. It carries the sample
 format, rate, frequency, start time and hardware, with gain, bandwidth,
@@ -308,3 +373,4 @@ GPL-3.0-or-later, matching UHD. See the licensing note in
 
 [uhd]: https://github.com/EttusResearch/uhd
 [just]: https://github.com/casey/just
+[csdr]: https://github.com/jketterl/csdr
