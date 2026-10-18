@@ -32,6 +32,8 @@
 //! | [`misc`] | local | the bitstream is in |
 //! | [`atr`] | radio | the AD936x is clocking |
 //! | [`time_core`] | radio | the AD936x is clocking |
+//! | [`rx_dsp`] | radio | the AD936x is clocking |
+//! | [`rx_framer`] | radio | the AD936x is clocking |
 //!
 //! That table is a bootstrap order, not a coincidence. The radio cores run off
 //! the codec's sample clock, the codec is started over SPI, and the SPI master
@@ -66,6 +68,9 @@ pub mod factory;
 pub mod misc;
 pub mod policy;
 pub mod radio_ctrl;
+pub mod rx_dsp;
+pub mod rx_framer;
+pub mod rx_stream;
 pub mod session;
 pub mod spi;
 pub mod time_core;
@@ -80,8 +85,12 @@ pub use policy::{
     UhdImagesCatalog, Verdict, negotiate,
 };
 pub use radio_ctrl::{ControlGate, CtrlPort, RadioCtrl};
+pub use rx_dsp::RxDsp;
+pub use rx_framer::RxFramer;
+pub use rx_stream::{B200RxStreamer, RxAntenna, RxOptions};
 pub use session::{
-    B200Session, Checkup, CodecGate, Flashed, OpenOptions, checkup, open, open_probed,
+    B200Session, Checkup, CodecGate, Flashed, OpenOptions, auto_master_clock_rate, checkup, open,
+    open_probed,
 };
 pub use spi::{CodecSpi, LocalSpi, Perif, SpiCore};
 pub use time_core::{Latch, TimeCore, TimeSource, TimerCheck};

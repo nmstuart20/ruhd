@@ -938,6 +938,7 @@ dependencies = [
 name = "uhd-cli"
 version = "0.1.0"
 dependencies = [
+ "ad936x",
  "clap",
  "serde_json",
  "sha2",

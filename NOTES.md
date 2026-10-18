@@ -211,6 +211,17 @@ justified.
   throws on a magic or layout-compat mismatch, so a board with a slightly
   corrupt EEPROM cannot be inspected with the tool you would use to diagnose it.
   `MbEeprom::problems()` lists the faults and leaves the fields readable.
+- **The receive queue is 128 transfers deep, not 16.** UHD's default
+  `num_recv_frames=16` of 8 KiB frames is about a millisecond of samples at
+  30 MS/s, so any scheduling delay longer than that overflows the FPGA's
+  buffer. On the bench B205mini over USB 3, 16 overflowed at 30.72 MS/s and
+  above; 128 (1 MiB) streamed 61.44 MS/s clean or nearly so. It stays
+  overridable through the `num_recv_frames` stream arg.
+- **Receive transfers request a whole number of USB packets.** UHD asks
+  libusb for 8176 bytes per transfer; nusb refuses an IN transfer that is not a
+  multiple of the endpoint's max packet size, so `rx_stream` rounds the request
+  up (8192 on USB 3). The FPGA's packet is still 8176 bytes and still ends in a
+  short USB packet, so the wire is unchanged.
 
 ## A B2xx changes identity when firmware loads
 
@@ -733,6 +744,8 @@ On top of that sit the settings-bus peripherals, one module each:
 | `misc` | `update_gpio_state`, `reset_codec`, `get_ref_locked` | local |
 | `atr` | `gpio_atr_3000.cpp`, `update_atrs` | radio |
 | `time_core` | `time_core_3000.cpp`, `update_time_source`, `set_time` | radio |
+| `rx_dsp` | `rx_dsp_core_3000.cpp` (B2xx variant) | radio |
+| `rx_framer` | `rx_vita_core_3000.cpp` | radio |
 
 `ad936x` now reproduces `ad9361_device_t::initialize` end to end: SPI and the
 identity gate; BBPLL and RFPLL integer/fractional synthesis; the characterized
@@ -779,7 +792,43 @@ Verified against a B205mini, from a bootloader-state device:
 `ruhd find` now registers a B2xx discovery factory and reports firmware-ready
 boards from their motherboard EEPROM without changing device state. The
 factory's generic `Device` open path remains deliberately unsupported until the
-trait implementation below lands, and no samples move.
+trait implementation below lands.
+
+### Receive streaming
+
+Samples move. `uhd_b200::rx_stream` ports the receive half of
+`b200_io_impl.cpp` and the single-channel paths of
+`super_recv_packet_handler.hpp`: it programs `rx_dsp` and `rx_framer`, enables
+the codec's receive chain and the ATR receive state, claims the data interface
+(2, bulk IN `0x86`), keeps a queue of transfers with the kernel, and implements
+`RawRxStreamer` over it — fragmenting packets across calls, timestamps per
+sample, sequence-gap and inline-message (overflow, late command) reporting, and
+UHD's overflow recovery (flush, then restart a continuous stream).
+`B200Session::init_radio` and `auto_master_clock_rate` supply the bring-up and
+`get_auto_tick_rate`. `ruhd rx` records to a file. Single channel and `sc16`
+on the wire only, so far.
+
+Verified on the bench B205mini (`3168B41`, FPGA 7.0, USB 3, UHD 4.10 for the
+comparisons):
+
+- an FM-band capture at 98 MHz, 8 MS/s matches stock `rx_samples_to_file` at
+  the same settings: power spectra correlate at 0.993 (0.03 against the
+  mirrored spectrum, so I and Q are the right way round), the same stations
+  appear at the same offsets, and `sc16` RMS and `fc32` scaling agree;
+- 3 s recordings to disk at 16, 30.72, 50 and 61.44 MS/s complete with no
+  overflows (`ruhd rx` writes on a separate thread). To `/dev/null` with
+  UHD's 16-transfer queue, ruhd and stock UHD both overflow at 30.72 MS/s and
+  above, which is what moved the default to 128;
+- `tests/hw_rx.rs` passes: a 10 000-sample burst returns exactly 10 000
+  samples ending in EOB; 200 000 continuous samples in 1500-sample reads have
+  timestamps that account for every sample; a late command is reported as
+  `LateCommand`; and a timed start lands within four output samples of the
+  commanded tick.
+
+That last bound is not zero, and that is the hardware rather than this driver:
+the command gates the DSP input and the timestamp is taken after the
+decimators. Stock UHD 4.10 on the same board stamps a timed start 67 ticks late
+at a 32 MHz clock and decimation 32; ruhd measures the same 67.
 
 `nusb` rather than `rusb`/`libusb`: it is pure Rust, so the build has no C
 dependency, and its enumeration reads sysfs without opening anything, which is
@@ -795,9 +844,13 @@ Rough order of work from here:
 3. ~~`ad936x` — the initialisation sequence.~~ Done through complete RF/sample
    rate tuning, gain, filtering, and calibration; hardware validation of the
    full path remains.
-4. `uhd-b200` — discovery/EEPROM identity is done; implement a real `Device`
-   over the open session: tick rate, tuning, gain, antenna and streamers.
-5. `chdr` — packet framing.
+4. `uhd-b200` — discovery/EEPROM identity is done, and single-channel receive
+   streaming works (see above). Still to do: a real `Device` over the open
+   session (so `registry::open` and `DeviceExt::rx_stream` work), the
+   transmit streamer, two-channel B210 receive, the `sc8`/`sc12` wire formats,
+   and the codec data-port loopback self-test UHD runs at init.
+5. ~~`chdr` — packet framing.~~ Done: `pack`, `unpack`, and the zero-copy
+   `parse_header` the receive path uses.
 6. `uhd-b200` streamers — first samples.
 
 Step 3 is the one that unblocks the rest: the scratch gate in `hw_compat.rs` and

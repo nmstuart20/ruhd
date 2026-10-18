@@ -311,6 +311,121 @@ impl B200Session {
         }
         Ok(count)
     }
+
+    /// Brings the radio up from cold: resets and initialises the AD936x, sets
+    /// the master clock rate, and readies every radio core.
+    ///
+    /// This is the part of `b200_impl`'s constructor that comes after the
+    /// settings bus is up: `reset_codec`, `init_codec`, the "enable something"
+    /// branch of `update_enables`, the default tick rate, the ATR banks in
+    /// their idle state, and the device time set to zero. Returns the master
+    /// clock rate the codec actually produced, which is the tick rate every
+    /// timestamp is counted in.
+    ///
+    /// Resetting the codec discards every tuning, gain and rate set before
+    /// the call. Tune after it, not before.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the codec initialisation or the settings bus reports.
+    pub fn init_radio(&self, master_clock_rate: f64) -> Result<f64> {
+        self.misc.reset_codec()?;
+        self.codec.init()?;
+        self.codec.set_active_chains(true, false, true, false)?;
+        let tick_rate = self.set_master_clock_rate(master_clock_rate)?;
+        for radio in 0..self.num_radio_chains()? {
+            let side = crate::rx_stream::side_for(radio, self.misc.swap_atr());
+            let atr = self.atr(radio)?;
+            atr.enable_atr()?;
+            atr.set_b2xx_states(side, false, false, true)?;
+            let time = self.time_core(radio)?;
+            time.set_tick_rate(tick_rate)?;
+            time.set_time_now(uhd_core::TimeSpec::default())?;
+        }
+        info!(
+            endpoint = %self.endpoint,
+            tick_rate,
+            "radio initialised"
+        );
+        Ok(tick_rate)
+    }
+
+    /// Changes the master clock rate, returning the rate the codec's BBPLL
+    /// actually produced.
+    ///
+    /// Streams opened before the change keep the old rate's timestamps and
+    /// decimation; reopen them.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::OutOfRange`] above the AD936x's 61.44 MHz; otherwise whatever
+    /// the codec reports.
+    pub fn set_master_clock_rate(&self, rate: f64) -> Result<f64> {
+        self.codec.set_sample_rate(rate)?;
+        Ok(self.codec.clock_rate())
+    }
+
+    /// Opens a single-channel receive stream.
+    ///
+    /// Programs the radio's DSP chain and framer for `options`, enables the
+    /// receive chain in the codec, switches the front end to receive on the
+    /// chosen port, and queues the USB transfers. Samples do not flow until a
+    /// stream command is issued.
+    ///
+    /// The codec must already be clocking — see [`B200Session::init_radio`] —
+    /// and tuning, gain and bandwidth are the codec's business, not the
+    /// stream's.
+    ///
+    /// `args.args` takes UHD's `spp`, `recv_frame_size` and `num_recv_frames`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotSupported`] for more than one channel or a wire format other
+    /// than `sc16`; [`Error::Usb`] if the data interface is already claimed;
+    /// [`Error::Device`] if the codec is not clocking.
+    pub fn rx_stream(
+        &self,
+        options: &crate::rx_stream::RxOptions,
+        args: &uhd_core::stream::StreamArgs,
+    ) -> Result<crate::rx_stream::B200RxStreamer> {
+        crate::rx_stream::open(self, options, args)
+    }
+}
+
+/// The master clock rate UHD would pick for a sample rate.
+///
+/// `ad936x_manager::get_auto_tick_rate`: the sample rate times the largest
+/// power of two that keeps it at or below the AD936x's maximum divided among
+/// the channels, so the DSP chain decimates by a power of two and both
+/// half-band filters are in use where they can be. A multiplier of exactly two
+/// is dropped to one when the sample rate is already a legal clock rate.
+///
+/// # Errors
+///
+/// [`Error::OutOfRange`] if the sample rate exceeds the per-channel maximum or
+/// no legal clock rate results.
+pub fn auto_master_clock_rate(rate: f64, num_chans: usize) -> Result<f64> {
+    let max = ad936x::MAX_CLOCK_RATE / num_chans.max(1) as f64;
+    let min = ad936x::MIN_CLOCK_RATE;
+    let out_of_range = |value: f64| Error::OutOfRange {
+        what: "sample rate".into(),
+        value,
+        start: 0.0,
+        stop: max,
+    };
+    if !rate.is_finite() || rate <= 0.0 || rate > max + 1.0 {
+        return Err(out_of_range(rate));
+    }
+    let lcm = rate.round().max(1.0);
+    let mut multiplier = 1u64 << ((max / lcm).log2().max(0.0) as u32);
+    if multiplier == 2 && lcm >= min {
+        multiplier = 1;
+    }
+    let tick = lcm * multiplier as f64;
+    if tick < min - 1.0 || tick > max + 1.0 {
+        return Err(out_of_range(rate));
+    }
+    Ok(tick)
 }
 
 /// Finds one B2xx and opens it.
@@ -607,6 +722,20 @@ fn describe(verdict: &Verdict) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_master_clock_rate_matches_ad936x_manager() {
+        // 1 MS/s: 61.44 / 1 -> 2^5, so 32 MHz and a decimation of 32.
+        assert_eq!(auto_master_clock_rate(1e6, 1).unwrap(), 32e6);
+        // 16 MS/s: the multiplier would be 2, which is dropped.
+        assert_eq!(auto_master_clock_rate(16e6, 1).unwrap(), 16e6);
+        assert_eq!(auto_master_clock_rate(2e6, 1).unwrap(), 32e6);
+        assert_eq!(auto_master_clock_rate(61.44e6, 1).unwrap(), 61.44e6);
+        // Two channels halve the ceiling.
+        assert_eq!(auto_master_clock_rate(16e6, 2).unwrap(), 16e6);
+        assert!(auto_master_clock_rate(40e6, 2).is_err());
+        assert!(auto_master_clock_rate(0.0, 1).is_err());
+    }
 
     #[test]
     fn options_build_up() {

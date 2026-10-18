@@ -13,6 +13,7 @@ name = "ruhd"
 path = "src/main.rs"
 
 [dependencies]
+ad936x.workspace = true
 uhd-b200.workspace = true
 uhd-core.workspace = true
 uhd-images = { workspace = true, features = ["download"] }

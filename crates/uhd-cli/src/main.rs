@@ -2,6 +2,7 @@
 //! `uhd_usrp_probe` and `uhd_images_downloader`.
 
 mod images;
+mod rx;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -80,6 +81,13 @@ enum Command {
     /// runs the same policy an open would, and prints the answer instead of
     /// acting on it.
     Doctor(DoctorArgs),
+    /// Record IQ samples from a B2xx to a file.
+    ///
+    /// Initialises the radio, tunes it, and streams `--nsamps` samples (or
+    /// `--duration` seconds) into `--file` as raw interleaved I/Q, the same
+    /// layout UHD's `rx_samples_to_file` writes. Build with `--release` for
+    /// sample rates above a few MS/s.
+    Rx(rx::RxArgs),
     /// Fetch and inspect the UHD images package.
     Images {
         #[command(subcommand)]
@@ -290,6 +298,7 @@ fn run(command: &Command) -> Result<()> {
         Command::Init(args) => init(args),
         Command::Doctor(args) => doctor(args),
         Command::Reset { serial } => reset(serial.as_deref()),
+        Command::Rx(args) => rx::run(args),
         Command::Images { action } => match action {
             ImagesAction::Status => images_status(),
             ImagesAction::Download(args) => images_download(args),

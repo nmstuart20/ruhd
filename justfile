@@ -81,6 +81,10 @@ ci: fmt-check clippy test doc
 cli *ARGS:
     cargo run --bin ruhd -- {{ARGS}}
 
+# Record IQ to a file (release build), e.g. `just rx --freq 98e6 --duration 2 --file fm.sc16`.
+rx *ARGS:
+    cargo run --release --bin ruhd -- rx {{ARGS}}
+
 # Fetch the pinned UHD reference checkout (see NOTES.md).
 reference:
     git submodule update --init --depth 1 reference/uhd

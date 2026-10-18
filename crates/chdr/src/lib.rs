@@ -212,29 +212,70 @@ pub fn pack(info: &IfPacketInfo, payload: &[u32], endian: Endian) -> Result<Vec<
         .collect())
 }
 
-/// Decode one complete legacy interface packet.
-pub fn unpack(bytes: &[u8], link_type: LinkType, endian: Endian) -> Result<IfPacket, Error> {
+/// A decoded interface-packet header, with the payload left where it is.
+///
+/// This is what the receive fast path wants: [`unpack`] copies the payload into
+/// a fresh `Vec` for every packet, which at tens of thousands of packets a
+/// second is an allocation per packet for bytes the caller is about to convert
+/// anyway. [`parse_header`] returns this instead, and the caller reads the
+/// payload straight out of the transfer buffer with
+/// [`IfHeader::payload_range`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IfHeader {
+    /// The decoded header.
+    pub info: IfPacketInfo,
+    /// How many words precede the payload, link header included.
+    pub header_words: usize,
+    /// How many whole words the payload occupies, including a partly used
+    /// last word.
+    pub payload_words: usize,
+    /// How many words the whole packet occupied, header and trailer included.
+    pub packet_words: usize,
+}
+
+impl IfHeader {
+    /// Where the meaningful payload bytes sit in the buffer that was parsed.
+    ///
+    /// The length is [`IfPacketInfo::payload_bytes`], so a partly used last
+    /// word is excluded.
+    #[must_use]
+    pub fn payload_range(&self) -> core::ops::Range<usize> {
+        let start = self.header_words * 4;
+        start..start + self.info.payload_bytes
+    }
+}
+
+/// Decode the header of one legacy interface packet without copying its
+/// payload.
+///
+/// `bytes` may extend past the end of the packet, as a USB transfer buffer
+/// does; the packet's own length field decides where it ends.
+pub fn parse_header(bytes: &[u8], link_type: LinkType, endian: Endian) -> Result<IfHeader, Error> {
     if bytes.len() < 4 || bytes.len() % 4 != 0 {
         return Err(Error("packet is not whole 32-bit words"));
     }
-    let words: Vec<u32> = bytes
-        .chunks_exact(4)
-        .map(|b| decode_word(b, endian))
-        .collect();
-    let (body, mut count, outer_header) = match link_type {
-        LinkType::Vrt | LinkType::Chdr => (&words[..], 0u16, 0usize),
+    let total_words = bytes.len() / 4;
+    let word = |i: usize| decode_word(&bytes[i * 4..i * 4 + 4], endian);
+
+    // `base` is where the VRT body starts, `body_len` how many words it may
+    // occupy. Only VRLP wraps the body in an outer header.
+    let (base, body_len, mut count) = match link_type {
+        LinkType::Vrt | LinkType::Chdr => (0usize, total_words, 0u16),
         LinkType::Vrlp => {
-            if words.len() < 4 || words[0] != VRLP {
+            if total_words < 4 || word(0) != VRLP {
                 return Err(Error("bad VRLP header"));
             }
-            let n = (words[1] & 0xfffff) as usize;
-            if n > words.len() || n < 4 || words[n - 1] != VEND {
+            let w1 = word(1);
+            let n = (w1 & 0xfffff) as usize;
+            if n > total_words || n < 4 || word(n - 1) != VEND {
                 return Err(Error("bad VRLP length or trailer"));
             }
-            (&words[2..n - 1], (words[1] >> 20) as u16, 2)
+            (2, n - 3, (w1 >> 20) as u16)
         }
     };
-    let mut vrt = body[0];
+    let body = |i: usize| word(base + i);
+
+    let mut vrt = body(0);
     let mut chdr_bytes = None;
     if link_type == LinkType::Chdr {
         let chdr = vrt;
@@ -251,7 +292,7 @@ pub fn unpack(bytes: &[u8], link_type: LinkType, endian: Endian) -> Result<IfPac
         chdr_bytes = Some(nbytes);
     }
     let packet_words = (vrt & 0xffff) as usize;
-    if packet_words > body.len() || packet_words == 0 {
+    if packet_words > body_len || packet_words == 0 {
         return Err(Error("bad VRT length or packet fragment"));
     }
     if link_type == LinkType::Vrt {
@@ -265,7 +306,10 @@ pub fn unpack(bytes: &[u8], link_type: LinkType, endian: Endian) -> Result<IfPac
     };
     let mut at = 1usize;
     let take = |at: &mut usize| -> Result<u32, Error> {
-        let v = *body.get(*at).ok_or(Error("truncated VRT header"))?;
+        if *at >= body_len {
+            return Err(Error("truncated VRT header"));
+        }
+        let v = body(*at);
         *at += 1;
         Ok(v)
     };
@@ -293,9 +337,9 @@ pub fn unpack(bytes: &[u8], link_type: LinkType, endian: Endian) -> Result<IfPac
     if at + usize::from(has_tlr) > packet_words {
         return Err(Error("invalid VRT header length"));
     }
-    let trailer = has_tlr.then(|| body[packet_words - 1]);
+    let trailer = has_tlr.then(|| body(packet_words - 1));
     let end = packet_words - usize::from(has_tlr);
-    let payload = body[at..end].to_vec();
+    let payload_words = end - at;
     let empty = trailer.map_or(0, |t| {
         let indicators = (t >> 20) & (t >> 8);
         OCC[((indicators >> 2) & 3) as usize] as usize
@@ -307,10 +351,10 @@ pub fn unpack(bytes: &[u8], link_type: LinkType, endian: Endian) -> Result<IfPac
         }
         n - overhead
     } else {
-        payload.len() * 4 - empty
+        payload_words * 4 - empty
     };
     let indicators = trailer.map_or(0, |t| (t >> 20) & (t >> 8));
-    Ok(IfPacket {
+    Ok(IfHeader {
         info: IfPacketInfo {
             link_type,
             packet_type,
@@ -324,9 +368,25 @@ pub fn unpack(bytes: &[u8], link_type: LinkType, endian: Endian) -> Result<IfPac
             trailer,
             payload_bytes,
         },
-        payload,
-        header_words: at + outer_header,
+        header_words: at + base,
+        payload_words,
         packet_words: packet_words + if link_type == LinkType::Vrlp { 3 } else { 0 },
+    })
+}
+
+/// Decode one complete legacy interface packet.
+pub fn unpack(bytes: &[u8], link_type: LinkType, endian: Endian) -> Result<IfPacket, Error> {
+    let header = parse_header(bytes, link_type, endian)?;
+    let payload = bytes[header.header_words * 4..]
+        .chunks_exact(4)
+        .take(header.payload_words)
+        .map(|b| decode_word(b, endian))
+        .collect();
+    Ok(IfPacket {
+        info: header.info,
+        payload,
+        header_words: header.header_words,
+        packet_words: header.packet_words,
     })
 }
 
@@ -423,5 +483,31 @@ mod tests {
                 .packet_count,
             0xabc
         );
+    }
+
+    #[test]
+    fn parse_header_locates_the_payload_inside_a_larger_transfer_buffer() {
+        // A B2xx RX data packet: CHDR word, SID, 64-bit TSF, then samples. USB
+        // hands it over in a buffer rounded up to the max packet size, so the
+        // parser has to trust the length field, not the buffer length.
+        let info = IfPacketInfo {
+            link_type: LinkType::Chdr,
+            packet_type: PacketType::Data,
+            packet_count: 42,
+            sid: Some(0xa0),
+            tsf: Some(0x0000_0001_0000_0002),
+            payload_bytes: 12,
+            ..Default::default()
+        };
+        let mut bytes = pack(&info, &[1, 2, 3], Endian::Little).unwrap();
+        bytes.resize(64, 0xee);
+
+        let header = parse_header(&bytes, LinkType::Chdr, Endian::Little).unwrap();
+        assert_eq!(header.info.packet_count, 42);
+        assert_eq!(header.info.sid, Some(0xa0));
+        assert_eq!(header.info.tsf, info.tsf);
+        assert_eq!(header.header_words, 4);
+        assert_eq!(header.payload_range(), 16..28);
+        assert_eq!(&bytes[header.payload_range()][..4], &1u32.to_le_bytes());
     }
 }

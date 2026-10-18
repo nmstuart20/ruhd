@@ -8,9 +8,10 @@ works against real hardware: `ruhd probe usb` finds and classifies a B2xx, and
 `ruhd init` takes one from freshly plugged in to FX3 firmware running, FPGA
 configured, and a live settings bus. Stock `uhd_usrp_probe` then opens the same
 device without reloading anything. `ruhd find` discovers firmware-ready B2xx
-devices; the generic device/streamer implementation is not complete, so no
-samples move yet. See [NOTES.md](NOTES.md) for the design rationale, the
-reference material, and the plan.
+devices, and `ruhd rx` records IQ from one (single channel, receive only). The
+generic `Device` implementation and transmit are not done yet. See
+[NOTES.md](NOTES.md) for the design rationale, the reference material, and the
+plan.
 
 ## Layout
 
@@ -18,9 +19,9 @@ reference material, and the plan.
 | --- | --- |
 | `uhd-core` | The object-safe `Device` trait, streamers, and the value types they trade in. No I/O. |
 | `uhd-transport` | Link, register and serial-bus traits; USB discovery, FX3 firmware and FPGA loading, the EEPROM map and settings-bus access (`usb`); image path resolution (`images`). |
-| `chdr` | Packet framing. Empty. |
+| `chdr` | Legacy CVITA/CHDR packet framing: pack, unpack, and a zero-copy header parser. |
 | `ad936x` | AD9361/AD9364 transceiver driver: complete initialization, RF/sample-rate tuning, gain tables and AGC, FIR/analog filters, and DC/quadrature calibration. |
-| `uhd-b200` | B2xx discovery, compatibility policy, open session, settings-bus peripherals, and AD936x board integration. |
+| `uhd-b200` | B2xx discovery, compatibility policy, open session, settings-bus peripherals, AD936x board integration, and the receive streamer. |
 | `uhd-cli` | The `ruhd` binary. |
 
 ## Getting started
@@ -86,6 +87,26 @@ or product to report until it is. `ready` means firmware is running.
 
 The full state machine, and the tables of vendor and product IDs it is built
 from, are documented in `uhd_transport::usb` (`just doc-open`).
+
+## Recording IQ
+
+```sh
+just cli init                                   # once per plug-in
+just rx --freq 98e6 --rate 8e6 --gain 40 --duration 2 --file fm.sc16
+just rx --freq 2.45e9 --rate 20e6 --nsamps 10000000 --type fc32 --file wifi.fc32
+```
+
+`just rx` is `ruhd rx` built with `--release`, because a debug build cannot
+keep up above a few MS/s. The file is raw interleaved I/Q in host byte order
+with no header, the same layout UHD's `rx_samples_to_file` writes, so anything
+that reads those reads these: `numpy.fromfile(f, dtype=numpy.int16)` for
+`sc16` (the default), `numpy.complex64` for `fc32`. Other options: `--bw`,
+`--ant RX2|TX/RX`, `--master-clock-rate` (chosen from `--rate` the way UHD does
+if omitted), `--spp`, `--num-recv-frames`, `--serial`.
+
+Overflows print `O` and sequence gaps `D`, as in UHD, and are counted at the
+end. On the bench B205mini over USB 3 a recording runs clean to disk at the
+AD9364's full 61.44 MS/s.
 
 ## Bringing a device up
 
