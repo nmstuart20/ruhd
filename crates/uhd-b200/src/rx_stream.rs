@@ -398,6 +398,9 @@ pub(crate) fn open(
             "the sample rate was coerced to the nearest master clock rate / decimation"
         );
     }
+    if let Some(message) = bandwidth_warning(rate) {
+        warn!("{message}");
+    }
 
     // A previous process may have left the framer running; stop it before
     // the stale packets are flushed.
@@ -826,9 +829,57 @@ fn convert(wire: &[u8], out: &mut [u8], host: SampleFormat, scale: f64) {
     }
 }
 
+/// `ad936x_manager::check_bandwidth`'s warning for a sample rate the codec's
+/// analog filters cannot match, which `b200_impl::update_rx_samp_rate` gives
+/// every time the RX rate is set.
+///
+/// UHD stays quiet when the user has set a bandwidth explicitly. This driver
+/// does not track that, so it always warns; the warning is still accurate,
+/// since the filters cannot go beyond these limits whatever is asked of them.
+fn bandwidth_warning(rate: f64) -> Option<String> {
+    if rate > ad936x::MAX_BW {
+        Some(format!(
+            "Selected Rx sample rate ({} MHz) is greater than analog frontend filter \
+             bandwidth ({} MHz).",
+            rate / 1e6,
+            ad936x::MAX_BW / 1e6
+        ))
+    } else if rate < ad936x::MIN_BW {
+        Some(format!(
+            "Selected Rx sample rate ({} MHz) is less than analog frontend filter \
+             bandwidth ({} MHz).",
+            rate / 1e6,
+            ad936x::MIN_BW / 1e6
+        ))
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bandwidth_warning_matches_check_bandwidth() {
+        assert_eq!(
+            bandwidth_warning(60e6).as_deref(),
+            Some(
+                "Selected Rx sample rate (60 MHz) is greater than analog frontend filter \
+                 bandwidth (56 MHz)."
+            )
+        );
+        assert_eq!(
+            bandwidth_warning(100e3).as_deref(),
+            Some(
+                "Selected Rx sample rate (0.1 MHz) is less than analog frontend filter \
+                 bandwidth (0.2 MHz)."
+            )
+        );
+        assert_eq!(bandwidth_warning(56e6), None);
+        assert_eq!(bandwidth_warning(200e3), None);
+        assert_eq!(bandwidth_warning(10e6), None);
+    }
 
     #[test]
     fn constants_match_b200_impl() {

@@ -116,8 +116,10 @@ just bench --rx-rate 10e6 --rx-cpu sc16 --overrun-threshold 0   # fail on any ov
 ```
 
 `ruhd benchmark` is the receive half of UHD's `benchmark_rate`: it streams
-into a buffer that is thrown away and prints the same summary block, plus the
-receive rate it actually achieved. The options take UHD's names too
+into a buffer that is thrown away and prints the same summary block, plus two
+cross-checks: the receive rate it actually achieved, and how many times a
+packet's device timestamp did not follow on from the previous one without an
+overflow to explain it (samples lost silently; this should always be 0). The options take UHD's names too
 (`--rx_rate`, `--rx_spp`, `--rx_spb`, `--rx_cpu`, `--rx_delay`, `--random`,
 `--overrun-threshold`, `--drop-threshold`), and the command answers to
 `benchmark_rate` as well. Transmit is not implemented yet, so the TX lines are

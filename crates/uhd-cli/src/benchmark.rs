@@ -82,6 +82,11 @@ struct Stats {
     late_commands: u64,
     timeouts_rx: u64,
     bad_packets: u64,
+    /// Times a packet's timestamp was not where the previous packet ended,
+    /// with no overflow or sequence error to account for it: samples lost
+    /// without the stream reporting it. Not counted with `--random`, whose
+    /// bursts are discontinuous by design.
+    time_jumps: u64,
     /// Samples received before the stop command went out.
     samps_before_stop: u64,
     /// Wall time from the first stream command (plus any start delay) to the
@@ -217,6 +222,7 @@ fn print_summary(stats: &Stats, rate: f64) {
     println!("  Num late commands:        {}", stats.late_commands);
     println!("  Num timeouts (Tx):        0");
     println!("  Num timeouts (Rx):        {}", stats.timeouts_rx);
+    println!("  Num timestamp jumps (Rx): {}", stats.time_jumps);
     if stats.bad_packets > 0 {
         println!("  Num bad packets (Rx):     {}", stats.bad_packets);
     }
@@ -305,6 +311,9 @@ fn benchmark_rx(
     let mut had_an_overflow = false;
     let mut last_time = TimeSpec::default();
     let mut stop_called = false;
+    // The sample index (device time in samples) the next packet should start
+    // at, while the stream is known to be continuous.
+    let mut expected: Option<i64> = None;
 
     loop {
         let elapsed = Instant::now() >= deadline;
@@ -334,6 +343,18 @@ fn benchmark_rx(
 
         match md.error {
             None => {
+                if let (false, Some(time), true) = (args.random, md.time_spec, n > 0) {
+                    let index = time.to_ticks(rate);
+                    if expected.is_some_and(|e| e != index) && !had_an_overflow {
+                        stats.time_jumps += 1;
+                        eprintln!(
+                            "[{}] Timestamp jump: expected sample {}, got {index}.",
+                            stamp(start),
+                            expected.unwrap_or_default()
+                        );
+                    }
+                    expected = Some(index + n as i64);
+                }
                 if had_an_overflow {
                     had_an_overflow = false;
                     if let Some(now) = md.time_spec {
@@ -356,6 +377,7 @@ fn benchmark_rx(
                 }
             }
             Some(RxError::Overflow) => {
+                expected = None;
                 last_time = md.time_spec.unwrap_or(last_time);
                 had_an_overflow = true;
                 if md.out_of_sequence {
@@ -371,6 +393,7 @@ fn benchmark_rx(
                     stamp(start)
                 );
                 stats.late_commands += 1;
+                expected = None;
                 let (cmd, n) = make_cmd(&mut rng)?;
                 nsamps = n;
                 let cmd = cmd.at(time_now()? + TimeSpec::from_secs(0.05));
@@ -385,6 +408,7 @@ fn benchmark_rx(
             }
             Some(RxError::BadPacket) => {
                 stats.bad_packets += 1;
+                expected = None;
                 eprintln!(
                     "[{}] Receiver error: bad packet, continuing...",
                     stamp(start)
