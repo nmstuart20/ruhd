@@ -20,7 +20,7 @@
 
 use std::fmt;
 use std::marker::PhantomData;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::args::DeviceArgs;
 use crate::error::{Error, Result};
@@ -198,6 +198,32 @@ pub trait RawRxStreamer: Send + fmt::Debug {
         timeout: Duration,
         md: &mut RxMetadata,
     ) -> Result<usize>;
+
+    /// Receives samples while observing progress inside a blocking receive.
+    ///
+    /// `progress` is called after copying each nonempty chunk, with its sample
+    /// count per channel and a monotonic host timestamp taken when copying
+    /// began. Chunk counts sum to the returned sample count. Implementations
+    /// must return already observed samples before reporting a later error.
+    /// The callback should do minimal work; it runs on the receive thread.
+    ///
+    /// The default implementation observes the entire result after
+    /// [`Self::recv_raw`] returns. Backends may override this for finer timing;
+    /// the B2xx backend observes each packet fragment. These timestamps do not
+    /// measure device time or time spent waiting in transport buffers.
+    fn recv_raw_with_progress(
+        &mut self,
+        buffs: &mut [&mut [u8]],
+        timeout: Duration,
+        md: &mut RxMetadata,
+        progress: &mut dyn FnMut(usize, Instant),
+    ) -> Result<usize> {
+        let n = self.recv_raw(buffs, timeout, md)?;
+        if n > 0 {
+            progress(n, Instant::now());
+        }
+        Ok(n)
+    }
 }
 
 /// A transmit streamer with its sample type erased.
@@ -461,6 +487,36 @@ mod tests {
             channels,
             host_format,
         })
+    }
+
+    #[test]
+    fn default_progress_preserves_data_and_reports_only_nonempty_results() {
+        let mut rx = fake(1, SampleFormat::Fc32);
+        let mut bytes = [0; 16];
+        let mut md = RxMetadata::default();
+        let mut observations = Vec::new();
+        let before = Instant::now();
+        let n = rx
+            .recv_raw_with_progress(
+                &mut [&mut bytes],
+                Duration::ZERO,
+                &mut md,
+                &mut |count, when| observations.push((count, when)),
+            )
+            .unwrap();
+        let after = Instant::now();
+        assert_eq!(n, 2);
+        assert_eq!(bytes, std::array::from_fn(|i| i as u8));
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].0, n);
+        assert!((before..=after).contains(&observations[0].1));
+        assert_eq!(
+            rx.recv_raw_with_progress(&mut [&mut []], Duration::ZERO, &mut md, &mut |_, _| panic!(
+                "empty receives must not report progress"
+            ),)
+                .unwrap(),
+            0
+        );
     }
 
     #[test]

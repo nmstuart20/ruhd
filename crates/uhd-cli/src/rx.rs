@@ -24,6 +24,7 @@ use uhd_core::{
 };
 
 use crate::rx_backlog::{Backlog, Snapshot};
+use crate::rx_latency::BlockTiming;
 use crate::rx_profile::{RxConfig, RxProfile};
 use crate::rx_stats::LossStats;
 use crate::sigmf::{self, Event, EventKind, Recording};
@@ -32,6 +33,31 @@ use crate::sigmf::{self, Event, EventKind, Recording};
 const FIRST_TIMEOUT: Duration = Duration::from_secs(1);
 /// How long a running stream may go quiet before it counts as stalled.
 const RUNNING_TIMEOUT: Duration = Duration::from_millis(500);
+
+struct FilledBlock {
+    block: Vec<u8>,
+    len: usize,
+    timing: BlockTiming,
+}
+
+impl FilledBlock {
+    fn hand_off(
+        block: Vec<u8>,
+        len: usize,
+        first_sample: Instant,
+        full: &mpsc::Sender<Self>,
+    ) -> Result<()> {
+        full.send(Self {
+            block,
+            len,
+            timing: BlockTiming {
+                first_sample,
+                handed_off: Instant::now(),
+            },
+        })
+        .map_err(|_| Error::Internal("the file writer stopped early".into()))
+    }
+}
 
 #[derive(Debug, Args)]
 pub(crate) struct RxArgs {
@@ -390,7 +416,7 @@ fn record(
         }
     });
 
-    let (full_tx, full_rx) = mpsc::channel::<(Vec<u8>, usize)>();
+    let (full_tx, full_rx) = mpsc::channel::<FilledBlock>();
     let (empty_tx, empty_rx) = mpsc::channel::<Vec<u8>>();
     for _ in 0..config.blocks {
         empty_tx
@@ -400,8 +426,15 @@ fn record(
     let writer_backlog = Arc::clone(&backlog);
     let writer = std::thread::spawn(move || -> io::Result<()> {
         let mut out = out;
-        for (block, len) in full_rx {
-            out.write_all(&block[..len])?;
+        for FilledBlock { block, len, timing } in full_rx {
+            let started = Instant::now();
+            let result = out.write_all(&block[..len]);
+            let finished = Instant::now();
+            if let Err(error) = result {
+                writer_backlog.failed_write();
+                return Err(error);
+            }
+            writer_backlog.completed(timing, started, finished);
             writer_backlog.written(len);
             // The receive loop may already have finished; a closed pool is fine.
             empty_tx.send(block).ok();
@@ -458,7 +491,7 @@ fn stream_blocks(
     block_samples: usize,
     host_bytes: usize,
     empty: &mpsc::Receiver<Vec<u8>>,
-    full: &mpsc::Sender<(Vec<u8>, usize)>,
+    full: &mpsc::Sender<FilledBlock>,
     tally: &mut Tally,
     backlog: &Backlog,
 ) -> Result<()> {
@@ -503,7 +536,7 @@ fn pump(
     block_samples: usize,
     host_bytes: usize,
     empty: &mpsc::Receiver<Vec<u8>>,
-    full: &mpsc::Sender<(Vec<u8>, usize)>,
+    full: &mpsc::Sender<FilledBlock>,
     tally: &mut Tally,
     backlog: &Backlog,
 ) -> Result<()> {
@@ -515,6 +548,7 @@ fn pump(
     let mut first = true;
     let mut block = empty.recv().map_err(|_| closed())?;
     let mut filled = 0usize;
+    let mut first_sample = None;
 
     let result = loop {
         if remaining(tally) == 0 || stop.load(Ordering::SeqCst) {
@@ -522,10 +556,14 @@ fn pump(
         }
         let room =
             (block_samples - filled).min(usize::try_from(remaining(tally)).unwrap_or(usize::MAX));
-        let n = match rx.recv_raw(
+        let n = match rx.recv_raw_with_progress(
             &mut [&mut block[filled * host_bytes..(filled + room) * host_bytes]],
             timeout,
             &mut md,
+            &mut |n, observed| {
+                first_sample.get_or_insert(observed);
+                backlog.received(n * host_bytes);
+            },
         ) {
             Ok(n) => n,
             Err(e) => break Err(e),
@@ -596,10 +634,15 @@ fn pump(
         }
         filled += n;
         tally.samples += n as u64;
-        backlog.received(n * host_bytes);
         if filled == block_samples {
-            full.send((block, filled * host_bytes))
-                .map_err(|_| closed())?;
+            FilledBlock::hand_off(
+                block,
+                filled * host_bytes,
+                first_sample
+                    .take()
+                    .expect("received samples have a host timestamp"),
+                full,
+            )?;
             filled = 0;
             // Do not wait on a slow writer before checking a finite limit or
             // Ctrl-C. Polling also makes Ctrl-C responsive under backpressure.
@@ -634,8 +677,12 @@ fn pump(
     // Keep samples from earlier receives even when the next receive fails.
     // The writer drains this block before record() returns the stream error.
     if filled > 0 {
-        full.send((block, filled * host_bytes))
-            .map_err(|_| closed())?;
+        FilledBlock::hand_off(
+            block,
+            filled * host_bytes,
+            first_sample.expect("received samples have a host timestamp"),
+            full,
+        )?;
     }
     result
 }
@@ -742,6 +789,126 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct ProgressRx {
+        inner: ScriptedRx,
+        first_sample: Instant,
+        gate: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>,
+    }
+
+    impl RawRxStreamer for ProgressRx {
+        fn num_channels(&self) -> usize {
+            self.inner.num_channels()
+        }
+        fn max_num_samps(&self) -> usize {
+            self.inner.max_num_samps()
+        }
+        fn host_format(&self) -> SampleFormat {
+            self.inner.host_format()
+        }
+        fn wire_format(&self) -> SampleFormat {
+            self.inner.wire_format()
+        }
+        fn issue_stream_cmd(&mut self, cmd: &StreamCmd) -> Result<()> {
+            self.inner.issue_stream_cmd(cmd)
+        }
+        fn recv_raw(
+            &mut self,
+            buffs: &mut [&mut [u8]],
+            timeout: Duration,
+            md: &mut RxMetadata,
+        ) -> Result<usize> {
+            self.inner.recv_raw(buffs, timeout, md)
+        }
+        fn recv_raw_with_progress(
+            &mut self,
+            buffs: &mut [&mut [u8]],
+            timeout: Duration,
+            md: &mut RxMetadata,
+            progress: &mut dyn FnMut(usize, Instant),
+        ) -> Result<usize> {
+            let n = self.inner.recv_raw(buffs, timeout, md)?;
+            if n > 0 {
+                progress(
+                    n,
+                    if self.gate.is_some() {
+                        self.first_sample
+                    } else {
+                        Instant::now()
+                    },
+                );
+                if let Some((copied, release)) = self.gate.take() {
+                    copied.send(()).unwrap();
+                    release.recv_timeout(Duration::from_secs(2)).unwrap();
+                }
+            }
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn progress_exposes_backlog_inside_receive_and_keeps_first_observation_for_partial_block() {
+        let first_sample = Instant::now() - Duration::from_millis(50);
+        let (copied_tx, copied_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let mut rx = ProgressRx {
+            inner: ScriptedRx::new([
+                Ok((vec![1; 8], RxMetadata::default())),
+                Ok((
+                    Vec::new(),
+                    RxMetadata {
+                        error: Some(RxError::Overflow),
+                        ..Default::default()
+                    },
+                )),
+                Ok((vec![2; 4], RxMetadata::default())),
+            ]),
+            first_sample,
+            gate: Some((copied_tx, release_rx)),
+        };
+        let backlog = Backlog::default();
+        let stop = AtomicBool::new(false);
+        let mut tally = Tally::default();
+        let (empty_tx, empty_rx) = mpsc::channel();
+        let (full_tx, full_rx) = mpsc::channel();
+        empty_tx.send(vec![0; 16 << 10]).unwrap();
+        std::thread::scope(|scope| {
+            let backlog = &backlog;
+            let tally = &mut tally;
+            let rx = &mut rx;
+            let stop = &stop;
+            let pump = scope.spawn(move || {
+                stream_blocks(
+                    rx,
+                    Some(3),
+                    stop,
+                    (16 << 10) / 4,
+                    4,
+                    &empty_rx,
+                    &full_tx,
+                    tally,
+                    backlog,
+                )
+            });
+            copied_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert_eq!(backlog.snapshot().pending, 8);
+            assert!(matches!(full_rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+            release_tx.send(()).unwrap();
+            pump.join().unwrap().unwrap();
+        });
+        let full = full_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(full.len, 12);
+        assert_eq!(full.timing.first_sample, first_sample);
+        assert!(full.timing.handed_off.duration_since(first_sample) >= Duration::from_millis(50));
+        assert_eq!(&full.block[..12], &[vec![1; 8], vec![2; 4]].concat());
+        assert_eq!(backlog.snapshot().pending, 12);
+        assert_eq!(tally.overflows, 1);
+        assert_eq!(
+            rx.inner.commands,
+            [StreamCmd::start_continuous(), StreamCmd::stop()]
+        );
+    }
+
     #[test]
     fn each_profile_delivers_its_block_size_and_flushes_the_tail() {
         for profile in [
@@ -782,6 +949,10 @@ mod tests {
             );
             assert_eq!(tally.backlog.pending, 0);
             assert_eq!(tally.backlog.written, bytes as u64 * 2 + 12);
+            assert_eq!(tally.backlog.latency.total.blocks, 3);
+            assert_eq!(tally.backlog.latency.fill.blocks, 3);
+            assert_eq!(tally.backlog.latency.queue.blocks, 3);
+            assert_eq!(tally.backlog.latency.write.blocks, 3);
             assert!(tally.backlog.peak <= bytes * config.blocks);
         }
     }
@@ -820,8 +991,8 @@ mod tests {
             });
             // Deliberately hold all blocks without confirming any writes.
             for _ in 0..config.blocks {
-                let (_, len) = full_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-                assert_eq!(len, config.block_bytes);
+                let full = full_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                assert_eq!(full.len, config.block_bytes);
             }
             assert_eq!(
                 backlog.snapshot().pending,
@@ -872,10 +1043,62 @@ mod tests {
         assert!(tally.output_closed);
         assert_eq!(tally.backlog.pending, 12);
         assert_eq!(tally.backlog.written, 0);
+        assert_eq!(tally.backlog.latency.total.blocks, 0);
+        assert_eq!(tally.backlog.latency.failed_writes, 1);
         assert_eq!(
             rx.commands,
             [StreamCmd::start_continuous(), StreamCmd::stop()]
         );
+    }
+
+    #[test]
+    fn output_stall_is_included_in_write_and_total_latency() {
+        struct GatedOutput {
+            capture: Capture,
+            started: mpsc::Sender<()>,
+            release: mpsc::Receiver<()>,
+        }
+        impl Write for GatedOutput {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.started.send(()).unwrap();
+                self.release.recv_timeout(Duration::from_secs(2)).unwrap();
+                self.capture.write(bytes)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                self.capture.flush()
+            }
+        }
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let capture = Capture::default();
+        let out = GatedOutput {
+            capture: capture.clone(),
+            started: started_tx,
+            release: release_rx,
+        };
+        let mut rx = ScriptedRx::new([Ok((vec![42; 12], RxMetadata::default()))]);
+        let mut tally = Tally::default();
+        std::thread::scope(|scope| {
+            let recording = scope.spawn(|| {
+                record(
+                    &mut rx,
+                    Box::new(out),
+                    Some(3),
+                    &AtomicBool::new(false),
+                    &mut tally,
+                )
+            });
+            started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            std::thread::sleep(Duration::from_millis(10));
+            release_tx.send(()).unwrap();
+            recording.join().unwrap().unwrap();
+        });
+        let latency = tally.backlog.latency;
+        assert_eq!(latency.total.blocks, 1);
+        assert!(latency.write.max >= Duration::from_millis(10));
+        assert!(latency.total.max >= latency.write.max);
+        assert_eq!(tally.backlog.pending, 0);
+        assert_eq!(*capture.bytes.lock().unwrap(), vec![42; 12]);
     }
 
     #[test]
@@ -1021,6 +1244,8 @@ mod tests {
         assert_eq!(tally.backlog.pending, 0);
         assert_eq!(tally.backlog.peak, 12);
         assert_eq!(tally.backlog.written, 12);
+        assert_eq!(tally.backlog.latency.total.blocks, 1);
+        assert_eq!(tally.backlog.latency.failed_writes, 0);
         assert!(tally.events.is_empty());
         assert_eq!(
             rx.commands,

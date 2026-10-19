@@ -697,6 +697,28 @@ impl RawRxStreamer for B200RxStreamer {
         timeout: Duration,
         md: &mut RxMetadata,
     ) -> Result<usize> {
+        self.recv_raw_impl(buffs, timeout, md, None)
+    }
+
+    fn recv_raw_with_progress(
+        &mut self,
+        buffs: &mut [&mut [u8]],
+        timeout: Duration,
+        md: &mut RxMetadata,
+        progress: &mut dyn FnMut(usize, Instant),
+    ) -> Result<usize> {
+        self.recv_raw_impl(buffs, timeout, md, Some(progress))
+    }
+}
+
+impl B200RxStreamer {
+    fn recv_raw_impl(
+        &mut self,
+        buffs: &mut [&mut [u8]],
+        timeout: Duration,
+        md: &mut RxMetadata,
+        mut progress: Option<&mut dyn FnMut(usize, Instant)>,
+    ) -> Result<usize> {
         *md = RxMetadata::default();
         let [out] = buffs else {
             return Err(Error::Buffer(format!(
@@ -796,12 +818,16 @@ impl RawRxStreamer for B200RxStreamer {
                 md.loss = packet.loss.take();
             }
             let start = packet.payload.start + packet.offset * WIRE_BYTES;
+            let observed = progress.as_ref().map(|_| Instant::now());
             convert(
                 &packet.buf[start..start + n * WIRE_BYTES],
                 &mut out[accum * host_bytes..(accum + n) * host_bytes],
                 self.host_format,
                 self.scale,
             );
+            if let (Some(progress), Some(observed)) = (progress.as_mut(), observed) {
+                progress(n, observed);
+            }
             packet.offset += n;
             accum += n;
 

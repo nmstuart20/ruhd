@@ -47,6 +47,8 @@ testing throughput near the device's maximum rate.
 Once a second, and after the writer finishes, stderr reports current and peak
 **application backlog** in bytes and sample-time milliseconds. It includes
 the partially filled receive block, queued blocks, and a block being written.
+The B2xx receive path updates this counter after each packet fragment is
+copied, including while a receive call is still filling the block.
 Bytes leave the backlog only after `write_all` completes. It excludes samples
 still in USB/device buffers and bytes already accepted by the OS or downstream
 reader. On output failure it conservatively includes an incomplete write's
@@ -55,6 +57,47 @@ exhausted and total time the receive loop waited for a free block. A rising
 backlog signals output pressure before the pool fills and RX has to wait.
 Ctrl-C stops the receive loop during that wait; shutdown drains accepted
 blocks, so a stalled output may still delay exit.
+
+The same live and final reports show **measured latency through ruhd**:
+
+```text
+  ruhd latency, cumulative mean/max ms (120 completed blocks, 0 failed writes):
+    fill 4.000/4.210; queue 0.020/0.080; write 0.030/0.120; total 4.050/4.300
+```
+
+These illustrative values describe four host-clock measurements per block:
+
+| Stage | Start | End |
+| --- | --- | --- |
+| `fill` | First packet fragment starts copying into the application block | Block handed to the writer |
+| `queue` | Block handed to the writer | Writer starts `write_all` |
+| `write` | Writer starts `write_all` | `write_all` succeeds |
+| `total` | First packet fragment starts copying into the application block | `write_all` succeeds |
+
+Mean and maximum are cumulative, with one observation per successfully written
+block, including the final partial block. Each stage's maximum can come from
+a different block, so the maxima need not add up to the total maximum.
+Before any block completes, the timings read `n/a`. Failed writes have their
+own count and do not contribute to successful-block timings. An ongoing write
+stall appears in backlog immediately; its latency enters the statistics when
+the write completes. A zero backlog can therefore coexist with significant
+block-fill latency.
+
+Timing starts at the first observed packet fragment in each block, after USB
+delivery and packet parsing. It excludes RF/device latency, waiting in USB
+buffers (including while the application pool is exhausted), and the wait for
+the first packet. For that reason, observed fill time can be below the sample
+batching budget: a packet's samples can already be buffered when the host
+copies them. It also includes host scheduling and conversion time between
+the two endpoints. All stages use monotonic host time; device timestamps are
+not compared with host clocks. Streamer backends using the default progress
+callback observe samples only when a receive call returns; B2xx provides the
+packet-level observations used here.
+
+Output acceptance means `write_all` returned successfully. It does not measure
+disk persistence, the final output flush, downstream csdr/ALSA processing, or
+radio-to-speaker latency. Use a known signal and observe the audio output to
+measure the full listening pipeline.
 
 Listen to broadcast FM with [csdr](https://github.com/ha7ilm/csdr#demodulate-wfm-advanced)
 and ALSA's `aplay`. Set `--freq` to a local station. `--type fc32` matches

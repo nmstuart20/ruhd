@@ -38,9 +38,9 @@ RX also writes SigMF metadata. See [hardware setup](docs/hardware.md) for USB
 permissions, image paths, and troubleshooting.
 
 See [Piping RX to stdout](docs/rx-pipelines.md) for FM listening, live processing,
-compression, and remote capture examples, plus RX profile budgets and backlog
-diagnostics. RX defaults to `low-latency` for stdout and `capture` for files;
-use `--profile balanced` for moderate batching.
+compression, and remote capture examples, plus RX profile budgets, backlog,
+and measured block-fill/queue/write latency. RX defaults to `low-latency` for
+stdout and `capture` for files; use `--profile balanced` for moderate batching.
 See [RX loss accounting and benchmarks](docs/rx-benchmarks.md) for exact loss
 counts, unknown-loss reporting, receive timing, and JSON benchmark reports.
 
