@@ -207,7 +207,7 @@ impl CompatReport {
     ///
     /// `None` when there is nothing to compare: no image loaded, no answer, or
     /// an unknown product so no expectation. That is deliberately distinct from
-    /// `Some(false)` — "cannot say" and "wrong" call for different responses.
+    /// `Some(false)` — "can't say" and "wrong" call for different responses.
     #[must_use]
     pub fn fpga_ok(&self) -> Option<bool> {
         let version = self.fpga.version()?;

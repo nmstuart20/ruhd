@@ -590,7 +590,7 @@ mod tests {
     fn open_firmware_counts_as_firmware() {
         let class = classify(ETTUS_VID, B200_PID, Some("Free Software Folks")).expect("recognised");
         assert_eq!(class.state, DeviceState::Ready);
-        // 0x2500:0x0020 cannot say which of the two it is.
+        // 0x2500:0x0020 can't say which of the two it is.
         assert_eq!(class.product, None);
     }
 

@@ -613,8 +613,8 @@ impl Checkup {
     pub fn headline(&self) -> String {
         match (&self.verdict, &self.trouble) {
             (Some(verdict), _) => verdict.headline(),
-            (None, Some(trouble)) => format!("cannot say — {trouble}"),
-            (None, None) => "cannot say".to_owned(),
+            (None, Some(trouble)) => format!("can't say: {trouble}"),
+            (None, None) => "can't say".to_owned(),
         }
     }
 
@@ -652,7 +652,7 @@ pub fn checkup(probe: &UsbProbe, catalog: &dyn ImageCatalog) -> Checkup {
 
     if probe.needs_firmware() {
         checkup.trouble = Some(format!(
-            "no firmware is running ({}), so the device has nothing to answer with",
+            "no firmware is running ({})",
             probe.state
         ));
         return checkup;
