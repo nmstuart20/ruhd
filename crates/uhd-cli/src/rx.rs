@@ -158,7 +158,7 @@ fn is_stdout(path: &Path) -> bool {
 /// The first Ctrl-C stops the stream at the next block and keeps everything
 /// recorded so far. A second one exits at once, for a device that has stopped
 /// answering.
-fn stop_on_ctrl_c() -> Result<Arc<AtomicBool>> {
+pub(crate) fn stop_on_ctrl_c() -> Result<Arc<AtomicBool>> {
     let stop = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&stop);
     ctrlc::set_handler(move || {

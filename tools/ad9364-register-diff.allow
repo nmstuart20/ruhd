@@ -1,9 +1,9 @@
 # Address  Mask  Stock-UHD-version-glob  Explanation
 #
 # Mask bits are permitted to differ between the stock-UHD and RUHD snapshots.
-# Every non-comment entry must also be documented in the Phase 3 register-dump
-# table in NOTES.md. `*` means the difference is independent of the stock UHD
-# version; a glob such as `4.6.*` confines an allowance to that reference.
+# Every non-comment entry must also be documented in the register-dump
+# table in docs/register-validation.md. `*` covers every stock UHD version;
+# a glob such as `4.6.*` confines an allowance to that reference.
 
 0x00c 0xfe * Bit 0 is the temperature start command; bits 7:1 are asynchronous status or Open readback.
 0x00e 0xff * Periodic internal die-temperature ADC readback; it changes with time and temperature.

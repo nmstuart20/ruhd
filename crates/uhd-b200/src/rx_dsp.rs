@@ -303,7 +303,7 @@ fn scalar(scaling_adjustment: f64, dsp_extra_scaling: f64) -> (i32, f64) {
 /// `get_freq_and_freq_word<32>`: the frequency is wrapped into the first
 /// Nyquist zone, scaled to a signed 32-bit fraction of the tick rate, and
 /// clamped where the scaling would overflow.
-fn freq_word(freq: f64, tick_rate: f64) -> (i32, f64) {
+pub(crate) fn freq_word(freq: f64, tick_rate: f64) -> (i32, f64) {
     let scale = 4_294_967_296.0;
     let scaled = wrap_frequency(freq / tick_rate, 1.0) * scale;
     let word = if scaled >= f64::from(i32::MAX) {

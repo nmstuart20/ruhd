@@ -4,7 +4,7 @@
 //! — see `NOTES.md`.
 //!
 //! Register [`B200Factory`] with [`register`] to open [`B200Device`] through
-//! [`uhd_core::registry::open`]. It implements receive configuration and
+//! [`uhd_core::registry::open`]. It implements receive/transmit configuration and
 //! streaming through [`uhd_core::Device`]; the lower-level [`B200Session`]
 //! remains available for bring-up and diagnostics.
 //!
@@ -39,6 +39,7 @@
 //! | [`time_core`] | radio | the AD936x is clocking |
 //! | [`rx_dsp`] | radio | the AD936x is clocking |
 //! | [`rx_framer`] | radio | the AD936x is clocking |
+//! | [`tx_dsp`] / [`tx_stream`] | radio | the AD936x is clocking |
 //!
 //! That table is a bootstrap order, not a coincidence. The radio cores run off
 //! the codec's sample clock, the codec is started over SPI, and the SPI master
@@ -80,6 +81,8 @@ pub mod rx_stream;
 pub mod session;
 pub mod spi;
 pub mod time_core;
+pub mod tx_dsp;
+pub mod tx_stream;
 
 pub use atr::{AtrMode, AtrOffsets, AtrReg, AtrStates, GpioAtr, Side};
 pub use codec::client_params;
@@ -101,4 +104,6 @@ pub use session::{
 };
 pub use spi::{CodecSpi, LocalSpi, Perif, SpiCore};
 pub use time_core::{Latch, TimeCore, TimeSource, TimerCheck};
+pub use tx_dsp::TxDsp;
+pub use tx_stream::{B200TxStreamer, TxOptions};
 pub use uhd_transport::usb::FpgaVersion;

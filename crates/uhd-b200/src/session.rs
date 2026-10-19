@@ -390,6 +390,19 @@ impl B200Session {
     ) -> Result<crate::rx_stream::B200RxStreamer> {
         crate::rx_stream::open(self, options, args)
     }
+
+    /// Opens single-channel sc16 transmission. Configure the codec first.
+    ///
+    /// Do not overlap session-level RX and TX streams: their codec enables
+    /// are exclusive. Use the public Device API to enforce that ownership.
+    /// Supports `spp`, `send_frame_size`, `num_send_frames`, and `underflow_policy`.
+    pub fn tx_stream(
+        &self,
+        options: &crate::TxOptions,
+        args: &uhd_core::StreamArgs,
+    ) -> Result<crate::B200TxStreamer> {
+        crate::tx_stream::open(self, options, args)
+    }
 }
 
 /// The master clock rate UHD would pick for a sample rate.

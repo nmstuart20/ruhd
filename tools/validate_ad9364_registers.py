@@ -26,7 +26,7 @@ REGISTER_COUNT = LAST_REGISTER + 1
 REPO = Path(__file__).resolve().parents[1]
 DEFAULT_ALLOW = Path(__file__).with_name("ad9364-register-diff.allow")
 STOCK_SOURCE = Path(__file__).with_name("stock_uhd_ad9364_init.cpp")
-NOTES = REPO / "NOTES.md"
+VALIDATION_DOC = REPO / "docs" / "register-validation.md"
 
 
 class Allowance(NamedTuple):
@@ -109,24 +109,24 @@ def compare(
     stock = parse_dump(stock_path)
     ruhd = parse_dump(ruhd_path)
     allowances = parse_allowances(allow_path)
-    notes = NOTES.read_text(encoding="utf-8")
+    documentation = VALIDATION_DOC.read_text(encoding="utf-8")
     stock_uhd_version = stock_uhd_version or recorded_uhd_version(stock_path, ruhd_path)
     differences = 0
     unexplained = 0
 
     undocumented = []
     for address, allowance in allowances.items():
-        notes_row = (
+        documented_row = (
             f"| {address:#05x} | {allowance.mask:#04x} | {allowance.uhd_version} | "
             f"{allowance.reason} |"
         )
-        if notes_row not in notes:
+        if documented_row not in documentation:
             undocumented.append(address)
     if undocumented:
         for address in undocumented:
             print(
                 f"UNDOCUMENTED ALLOWANCE {address:#05x}: matching "
-                f"address/mask/version/reason row is absent from {NOTES.name}",
+                f"address/mask/version/reason row is absent from {VALIDATION_DOC.name}",
                 file=sys.stderr,
             )
         print(

@@ -124,10 +124,21 @@ fn configuration_reports_actual_values_and_rejects_invalid_requests() {
             .set_gain(Direction::Rx, 0, Some("invalid"), 1.0)
             .is_err()
     );
-    assert!(matches!(
-        device.open_tx_stream(&StreamArgs::new()),
-        Err(Error::NotSupported(_))
-    ));
+    device.set_sample_rate(Direction::Tx, 0, 2e6).unwrap();
+    let tx_tune = device
+        .tune_to(
+            Direction::Tx,
+            0,
+            TuneRequest::new(915e6).with_lo_offset(1e6),
+        )
+        .unwrap();
+    assert!((tx_tune.actual_freq() - 915e6).abs() < 1.0);
+    assert!((device.center_freq(Direction::Tx, 0).unwrap() - 915e6).abs() < 1.0);
+    device.set_gain(Direction::Tx, 0, None, 10.1).unwrap();
+    assert_eq!(device.gain(Direction::Tx, 0, None).unwrap(), 10.25);
+    assert_eq!(device.antennas(Direction::Tx, 0).unwrap(), ["TX/RX"]);
+    assert!(device.set_antenna(Direction::Tx, 0, "RX2").is_err());
+    assert!(device.set_agc(Direction::Tx, 0, true).is_err());
     // A rejected stream format must leave the device available.
     let mut args = StreamArgs::new();
     args.wire_format = uhd_core::SampleFormat::Sc8;

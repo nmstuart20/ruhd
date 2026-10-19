@@ -272,7 +272,7 @@ impl UsbProbe {
              or use sudo"
         } else {
             "install the udev rules with `just udev-install` (udev/60-ruhd-b2xx.rules), \
-             then replug; over SSH also join the usrp group. See \"USB permissions\" in README.md"
+             then replug; over SSH also join the usrp group. See docs/hardware.md"
         };
         Error::Usb(format!(
             "permission denied opening {}; {fix}",

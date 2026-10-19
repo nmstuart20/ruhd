@@ -85,6 +85,10 @@ cli *ARGS:
 rx *ARGS:
     cargo run --release --bin ruhd -- rx {{ARGS}}
 
+# Transmit a raw IQ file, e.g. `just tx --freq 915e6 --rate 1e6 --file burst.sc16`.
+tx *ARGS:
+    cargo run --release --bin ruhd -- tx {{ARGS}}
+
 # Receive throughput benchmark (release build), e.g. `just bench --rx-rate 61.44e6 --duration 10`.
 bench *ARGS:
     cargo run --release --bin ruhd -- benchmark {{ARGS}}

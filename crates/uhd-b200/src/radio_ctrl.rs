@@ -32,7 +32,7 @@ use chdr::{Endian, IfPacketInfo, LinkType, PacketType};
 use nusb::MaybeFuture;
 use nusb::transfer::{Buffer, Bulk, In, Out};
 use tracing::{debug, trace, warn};
-use uhd_core::{Error, Result};
+use uhd_core::{AsyncEvent, AsyncMetadata, Error, Result, TimeSpec};
 use uhd_transport::usb::{FpgaVersion, Fx3Iface};
 use uhd_transport::{RegisterIface, UsbEndpoint};
 
@@ -88,7 +88,7 @@ pub struct ControlGate {
 /// [`session`](crate::session) — and every register address below comes from
 /// its [`FpgaShim`] rather than from a constant. That is what keeps a second
 /// supported major from meaning a second set of `if` statements in here.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct RadioCtrl {
     inner: Arc<Mutex<Transport>>,
     endpoint: UsbEndpoint,
@@ -115,6 +115,46 @@ struct Transport {
     seq_out: u64,
     outstanding: VecDeque<Pending>,
     frame_size: usize,
+    async_events: VecDeque<TxEvent>,
+}
+
+#[derive(Debug)]
+struct TxEvent {
+    channel: usize,
+    tsf: Option<u64>,
+    event: AsyncEvent,
+}
+
+fn tx_event(packet: &chdr::IfPacket) -> Option<TxEvent> {
+    let channel = match packet.info.sid? {
+        0x0050_0000 => 0,
+        0x0060_0000 => 1,
+        _ => return None,
+    };
+    if packet.info.packet_type != PacketType::Context {
+        return None;
+    }
+    let event = match packet.payload.first()? & 0xff {
+        1 => AsyncEvent::BurstAck,
+        2 => AsyncEvent::Underflow,
+        4 => AsyncEvent::SeqError,
+        8 => AsyncEvent::TimeError,
+        16 => AsyncEvent::UnderflowInPacket,
+        32 => AsyncEvent::SeqErrorInBurst,
+        64 => {
+            let mut words = [0; 4];
+            for (dst, src) in words.iter_mut().zip(packet.payload.iter().skip(1)) {
+                *dst = *src;
+            }
+            AsyncEvent::UserPayload(words)
+        }
+        _ => return None,
+    };
+    Some(TxEvent {
+        channel,
+        tsf: packet.info.tsf,
+        event,
+    })
 }
 
 /// A settings-bus port bound to one core's stream ID.
@@ -208,6 +248,7 @@ impl RadioCtrl {
             seq_out: 0,
             outstanding: VecDeque::new(),
             frame_size,
+            async_events: VecDeque::new(),
         };
         inner.flush();
         Ok(Self {
@@ -234,6 +275,64 @@ impl RadioCtrl {
     #[must_use]
     pub fn endpoint(&self) -> &UsbEndpoint {
         &self.endpoint
+    }
+
+    /// Polls TX events on the shared control endpoint without consuming register replies.
+    pub(crate) fn recv_tx_event(
+        &self,
+        channel: usize,
+        tick_rate: f64,
+        timeout: Duration,
+    ) -> Result<Option<AsyncMetadata>> {
+        let mut t = self
+            .inner
+            .lock()
+            .map_err(|_| Error::internal("B2xx control lock poisoned"))?;
+        // Retire pending register operations through the same demultiplexer.
+        while !t.outstanding.is_empty() {
+            t.wait_one(false)?;
+        }
+        let deadline = std::time::Instant::now() + timeout;
+        let mut polled = false;
+        loop {
+            if let Some(index) = t.async_events.iter().position(|e| e.channel == channel) {
+                let event = t.async_events.remove(index).unwrap();
+                return Ok(Some(AsyncMetadata {
+                    channel,
+                    time_spec: event
+                        .tsf
+                        .map(|ticks| TimeSpec::from_ticks(ticks as i64, tick_rate)),
+                    event: event.event,
+                }));
+            }
+            if polled && std::time::Instant::now() >= deadline {
+                return Ok(None);
+            }
+            polled = true;
+            let wait = deadline.saturating_duration_since(std::time::Instant::now());
+            let frame_size = t.frame_size;
+            let c = t.recv.transfer_blocking(Buffer::new(frame_size), wait);
+            if c.status == Err(nusb::transfer::TransferError::Cancelled) {
+                return Ok(None);
+            }
+            let bytes = c
+                .into_result()
+                .map_err(|e| Error::Transport(format!("TX event receive failed: {e}")))?;
+            if let Ok(packet) = chdr::unpack(&bytes, LinkType::Chdr, Endian::Little) {
+                t.queue_tx_event(&packet);
+            }
+        }
+    }
+
+    pub(crate) fn clear_tx_events(&self) -> Result<()> {
+        // A readback is a barrier after the deframer reset and routes stale events.
+        self.radio(0)?.peek32(0)?;
+        self.inner
+            .lock()
+            .map_err(|_| Error::internal("B2xx control lock poisoned"))?
+            .async_events
+            .clear();
+        Ok(())
     }
 
     /// A port onto the local core: the compatibility register, the SPI core,
@@ -354,6 +453,17 @@ impl RadioCtrl {
 }
 
 impl Transport {
+    fn queue_tx_event(&mut self, packet: &chdr::IfPacket) -> bool {
+        if let Some(event) = tx_event(packet) {
+            if self.async_events.len() >= 1000 {
+                self.async_events.pop_front();
+            }
+            self.async_events.push_back(event);
+            true
+        } else {
+            false
+        }
+    }
     fn flush(&mut self) {
         for _ in 0..100 {
             let c = self
@@ -421,6 +531,9 @@ impl Transport {
                     continue;
                 }
             };
+            if self.queue_tx_event(&packet) {
+                continue;
+            }
             if packet.info.sid != Some(resp_sid)
                 || packet.info.packet_type != PacketType::Context
                 || packet.payload.len() != 2
@@ -573,5 +686,49 @@ mod tests {
             SequenceRelation::Match
         );
         assert_ne!(local.resp_sid, radio.resp_sid);
+    }
+}
+
+#[cfg(test)]
+mod tx_event_tests {
+    use super::*;
+    fn packet(sid: u32, payload: &[u32]) -> chdr::IfPacket {
+        let info = IfPacketInfo {
+            link_type: LinkType::Chdr,
+            packet_type: PacketType::Context,
+            sid: Some(sid),
+            tsf: Some(1234),
+            payload_bytes: payload.len() * 4,
+            ..Default::default()
+        };
+        chdr::unpack(
+            &chdr::pack(&info, payload, Endian::Little).unwrap(),
+            LinkType::Chdr,
+            Endian::Little,
+        )
+        .unwrap()
+    }
+    #[test]
+    fn tx_messages_are_distinct_from_register_replies_and_keep_time_and_channel() {
+        for (code, expected) in [
+            (1, AsyncEvent::BurstAck),
+            (2, AsyncEvent::Underflow),
+            (4, AsyncEvent::SeqError),
+            (8, AsyncEvent::TimeError),
+            (16, AsyncEvent::UnderflowInPacket),
+            (32, AsyncEvent::SeqErrorInBurst),
+        ] {
+            let event = tx_event(&packet(0x0060_0000, &[0x100 | code])).unwrap();
+            assert_eq!(event.channel, 1);
+            assert_eq!(event.tsf, Some(1234));
+            assert_eq!(event.event, expected);
+        }
+        assert!(tx_event(&packet(LOCAL_RESP_SID, &[1, 2])).is_none());
+        assert!(tx_event(&packet(0x0050_0000, &[])).is_none());
+        assert!(tx_event(&packet(0x0050_0000, &[0])).is_none());
+        assert_eq!(
+            tx_event(&packet(0x0050_0000, &[64, 1, 2])).unwrap().event,
+            AsyncEvent::UserPayload([1, 2, 0, 0])
+        );
     }
 }

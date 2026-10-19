@@ -1,24 +1,23 @@
 //! Public device API over a B2xx session.
 //!
-//! Receive configuration and streaming are implemented. TX operations return
-//! `NotSupported`; channel counts describe the physical hardware. One receive
-//! streamer may exist at a time, including on a B210. The B210's RX LO and
-//! analog bandwidth are shared, while gain, antenna and DSP settings are per
-//! channel.
+//! Single-channel receive and transmit configuration and streaming. One RX or
+//! TX streamer may exist at a time. Each direction shares its LO and analog
+//! bandwidth across B210 channels; gains and DSP settings are per channel.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use ad936x::{Chain, Direction as CodecDirection};
 use uhd_core::{
-    Device, DeviceArgs, DeviceExt, DeviceInfo, Direction, Error, MetaRange, Range, RawRxStreamer,
-    RawTxStreamer, Result, RxMetadata, SampleFormat, SensorData, SensorScope, SensorValue,
-    StreamArgs, StreamCmd, TimeSpec, TunePolicy, TuneRequest, TuneResult,
+    AsyncMetadata, Device, DeviceArgs, DeviceExt, DeviceInfo, Direction, Error, MetaRange, Range,
+    RawRxStreamer, RawTxStreamer, Result, RxMetadata, SampleFormat, SensorData, SensorScope,
+    SensorValue, StreamArgs, StreamCmd, TimeSpec, TunePolicy, TuneRequest, TuneResult, TxMetadata,
 };
 
 use crate::time_core::{pulse_sync, set_time_source};
 use crate::{
-    B200RxStreamer, B200Session, RefSel, RxAntenna, RxDsp, RxOptions, TimeCore, TimeSource,
+    B200RxStreamer, B200Session, B200TxStreamer, RefSel, RxAntenna, RxDsp, RxOptions, TimeCore,
+    TimeSource, TxDsp, TxOptions,
 };
 
 const MIN_RF: f64 = 70e6;
@@ -36,7 +35,7 @@ const DEFAULT_RATE: f64 = 1e6;
 /// Configuration calls are serialized. Rate, clock, time and time-source
 /// changes are refused while a streamer exists, even after a stop command;
 /// drop the streamer to release that restriction. Tuning, manual gain,
-/// bandwidth, AGC and antenna changes are permitted during reception and can
+/// bandwidth, RX AGC and antenna changes are permitted during streaming and can
 /// introduce discontinuities. Streamers retain the device until they close.
 #[derive(Debug)]
 pub struct B200Device {
@@ -57,12 +56,16 @@ struct State {
     fixed_clock: bool,
     requested_rates: Vec<f64>,
     dsp: Vec<RxDsp>,
+    tx_dsp: Vec<TxDsp>,
+    tx_requested_rates: Vec<f64>,
+    tx_gains: Vec<f64>,
+    tx_bandwidth: Option<f64>,
     time: Vec<TimeCore>,
     antennas: Vec<RxAntenna>,
     gains: Vec<f64>,
     agc: Vec<bool>,
     bandwidth: Option<f64>,
-    stream_channel: Option<usize>,
+    stream_channel: Option<(Direction, usize)>,
     time_source: TimeSource,
 }
 
@@ -70,7 +73,7 @@ impl State {
     fn require_idle(&self) -> Result<()> {
         if self.stream_channel.is_some() {
             return Err(Error::device(
-                "drop the existing RX streamer before opening another stream or changing timing configuration",
+                "drop the existing RX or TX streamer before opening another stream or changing timing configuration",
             ));
         }
         Ok(())
@@ -98,7 +101,7 @@ fn validate_clock(rate: f64) -> Result<()> {
 }
 
 impl B200Device {
-    /// Initializes an owned session and its receive controls.
+    /// Initializes an owned session and its receive/transmit controls.
     ///
     /// This resets the codec and discards its previous configuration. Supported
     /// options are `master_clock_rate` and `auto_flash` (the latter is applied
@@ -120,6 +123,7 @@ impl B200Device {
         );
         let mut dsp = Vec::new();
         let mut time = Vec::new();
+        let mut tx_dsp = Vec::new();
         for chan in 0..channels {
             let mut core = RxDsp::new(Box::new(session.ctrl().radio(chan)?));
             core.set_tick_rate(tick_rate)?;
@@ -127,6 +131,15 @@ impl B200Device {
             core.set_host_rate(DEFAULT_RATE)?;
             core.setup_sc16()?;
             dsp.push(core);
+            let mut tx = TxDsp::new(Box::new(session.ctrl().radio(chan)?));
+            tx.set_tick_rate(tick_rate)?;
+            tx.set_host_rate(DEFAULT_RATE)?;
+            tx_dsp.push(tx);
+            session.codec().set_gain(
+                CodecDirection::Tx,
+                chain_for(chan, session.misc().swap_atr()),
+                0.0,
+            )?;
             let timer = session.time_core(chan)?;
             timer.set_tick_rate(tick_rate)?;
             time.push(timer);
@@ -143,9 +156,10 @@ impl B200Device {
         }
         pulse_sync(&session.ctrl().local(), session.compat(), time_source)?;
         if session.shim().has_bandsel() {
-            session
-                .misc()
-                .set_bandsel(Some(session.codec().freq(CodecDirection::Rx)), None)?;
+            session.misc().set_bandsel(
+                Some(session.codec().freq(CodecDirection::Rx)),
+                Some(session.codec().freq(CodecDirection::Tx)),
+            )?;
         }
         Ok(Self {
             info,
@@ -157,6 +171,10 @@ impl B200Device {
                     fixed_clock: clock.is_some(),
                     requested_rates: vec![DEFAULT_RATE; channels],
                     dsp,
+                    tx_dsp,
+                    tx_requested_rates: vec![DEFAULT_RATE; channels],
+                    tx_gains: vec![0.0; channels],
+                    tx_bandwidth: None,
                     time,
                     antennas: vec![RxAntenna::Rx2; channels],
                     gains: vec![0.0; channels],
@@ -174,14 +192,6 @@ impl B200Device {
             .state
             .lock()
             .map_err(|_| Error::internal("B2xx configuration lock poisoned; reopen the device"))
-    }
-
-    fn rx_channel(&self, dir: Direction, chan: usize) -> Result<()> {
-        self.check_channel(dir, chan)?;
-        if dir == Direction::Tx {
-            return Err(Error::not_supported("B2xx transmit control and streaming"));
-        }
-        Ok(())
     }
 
     fn mboard(&self, index: usize) -> Result<()> {
@@ -217,6 +227,16 @@ impl B200Device {
                 .codec()
                 .set_bandwidth(CodecDirection::Rx, bandwidth)?;
         }
+        if let Some(bandwidth) = state.tx_bandwidth {
+            self.shared
+                .session
+                .codec()
+                .set_bandwidth(CodecDirection::Tx, bandwidth)?;
+        }
+        for (chan, dsp) in state.tx_dsp.iter_mut().enumerate() {
+            dsp.set_tick_rate(state.tick_rate)?;
+            dsp.set_host_rate(state.tx_requested_rates[chan])?;
+        }
         for (chan, dsp) in state.dsp.iter_mut().enumerate() {
             dsp.set_tick_rate(state.tick_rate)?;
             dsp.set_host_rate(state.requested_rates[chan])?;
@@ -232,6 +252,13 @@ impl B200Device {
             state.time_source,
         )?;
         Ok(state.tick_rate)
+    }
+}
+
+fn codec_direction(dir: Direction) -> CodecDirection {
+    match dir {
+        Direction::Rx => CodecDirection::Rx,
+        Direction::Tx => CodecDirection::Tx,
     }
 }
 
@@ -284,7 +311,7 @@ impl Device for B200Device {
     }
 
     fn set_sample_rate(&self, dir: Direction, chan: usize, rate: f64) -> Result<f64> {
-        self.rx_channel(dir, chan)?;
+        self.check_channel(dir, chan)?;
         if !rate.is_finite() || rate <= 0.0 {
             return Err(Error::invalid_arg(
                 "sample rate must be positive and finite",
@@ -292,27 +319,48 @@ impl Device for B200Device {
         }
         let mut state = self.state()?;
         state.require_idle()?;
-        let previous_rate = state.requested_rates[chan];
-        state.requested_rates[chan] = rate;
+        let previous_rate = if dir == Direction::Rx {
+            state.requested_rates[chan]
+        } else {
+            state.tx_requested_rates[chan]
+        };
+        if dir == Direction::Rx {
+            state.requested_rates[chan] = rate;
+        } else {
+            state.tx_requested_rates[chan] = rate;
+        }
         // Reapply this channel's new rate during the clock change, avoiding
         // an intermediate decimation (and warnings) for its previous rate.
         let result = (|| {
             if !state.fixed_clock {
                 self.change_clock(&mut state, crate::auto_master_clock_rate(rate, 1)?)?;
             }
-            state.dsp[chan].set_host_rate(rate)
+            if dir == Direction::Rx {
+                state.dsp[chan].set_host_rate(rate)
+            } else {
+                state.tx_dsp[chan].set_host_rate(rate)
+            }
         })();
         if result.is_err() {
-            state.requested_rates[chan] = previous_rate;
+            if dir == Direction::Rx {
+                state.requested_rates[chan] = previous_rate;
+            } else {
+                state.tx_requested_rates[chan] = previous_rate;
+            }
         }
         result
     }
     fn sample_rate(&self, dir: Direction, chan: usize) -> Result<f64> {
-        self.rx_channel(dir, chan)?;
-        Ok(self.state()?.dsp[chan].host_rate())
+        self.check_channel(dir, chan)?;
+        let state = self.state()?;
+        Ok(if dir == Direction::Rx {
+            state.dsp[chan].host_rate()
+        } else {
+            state.tx_dsp[chan].host_rate()
+        })
     }
     fn sample_rates(&self, dir: Direction, chan: usize) -> Result<MetaRange> {
-        self.rx_channel(dir, chan)?;
+        self.check_channel(dir, chan)?;
         let state = self.state()?;
         // Advertise the discrete rates at the current master clock.
         MetaRange::new(
@@ -322,35 +370,45 @@ impl Device for B200Device {
         )
     }
     fn tune(&self, dir: Direction, chan: usize, request: &TuneRequest) -> Result<TuneResult> {
-        self.rx_channel(dir, chan)?;
+        self.check_channel(dir, chan)?;
         let mut state = self.state()?;
         let codec = self.shared.session.codec();
         let (target, rf) = tune_plan(
             request,
-            codec.freq(CodecDirection::Rx),
-            state.tick_rate.min(codec.bandwidth(CodecDirection::Rx)) / 2.0,
+            codec.freq(codec_direction(dir)),
+            state.tick_rate.min(codec.bandwidth(codec_direction(dir))) / 2.0,
         )?;
         let actual_rf = if request.rf_freq_policy == TunePolicy::None {
             rf
         } else {
-            codec.tune(CodecDirection::Rx, rf)?
+            codec.tune(codec_direction(dir), rf)?
         };
         if self.shared.session.shim().has_bandsel() {
-            self.shared
-                .session
-                .misc()
-                .set_bandsel(Some(actual_rf), None)?;
+            self.shared.session.misc().set_bandsel(
+                (dir == Direction::Rx).then_some(actual_rf),
+                (dir == Direction::Tx).then_some(actual_rf),
+            )?;
         }
         let dsp = match request.dsp_freq_policy {
-            TunePolicy::None => state.dsp[chan].freq(),
+            TunePolicy::None => {
+                if dir == Direction::Rx {
+                    state.dsp[chan].freq()
+                } else {
+                    -state.tx_dsp[chan].freq()
+                }
+            }
             TunePolicy::Auto => actual_rf - target,
             TunePolicy::Manual => request.dsp_freq,
         }
         .clamp(-state.tick_rate / 2.0, state.tick_rate / 2.0);
         let actual_dsp = if request.dsp_freq_policy == TunePolicy::None {
             dsp
-        } else {
+        } else if dir == Direction::Rx {
             state.dsp[chan].set_freq(dsp)?
+        } else {
+            // The core API reports RF minus DSP in either direction; the
+            // physical TX upconverter adds its frequency to the RF LO.
+            -state.tx_dsp[chan].set_freq(-dsp)?
         };
         Ok(TuneResult {
             clipped_rf_freq: target,
@@ -361,56 +419,81 @@ impl Device for B200Device {
         })
     }
     fn center_freq(&self, dir: Direction, chan: usize) -> Result<f64> {
-        self.rx_channel(dir, chan)?;
+        self.check_channel(dir, chan)?;
         let state = self.state()?;
-        Ok(self.shared.session.codec().freq(CodecDirection::Rx) - state.dsp[chan].freq())
+        Ok(self.shared.session.codec().freq(codec_direction(dir))
+            - (if dir == Direction::Rx {
+                state.dsp[chan].freq()
+            } else {
+                -state.tx_dsp[chan].freq()
+            }))
     }
     fn freq_range(&self, dir: Direction, chan: usize) -> Result<MetaRange> {
-        self.rx_channel(dir, chan)?;
+        self.check_channel(dir, chan)?;
         let state = self.state()?;
         let half = state
             .tick_rate
-            .min(self.shared.session.codec().bandwidth(CodecDirection::Rx))
+            .min(self.shared.session.codec().bandwidth(codec_direction(dir)))
             / 2.0;
         Ok(Range::continuous(MIN_RF - half, MAX_RF + half).into())
     }
     fn fe_freq_range(&self, dir: Direction, chan: usize) -> Result<MetaRange> {
-        self.rx_channel(dir, chan)?;
+        self.check_channel(dir, chan)?;
         Ok(Range::continuous(MIN_RF, MAX_RF).into())
     }
     fn gain_names(&self, dir: Direction, chan: usize) -> Result<Vec<String>> {
-        self.rx_channel(dir, chan)?;
+        self.check_channel(dir, chan)?;
         Ok(vec!["PGA".into()])
     }
     fn set_gain(&self, dir: Direction, chan: usize, name: Option<&str>, gain: f64) -> Result<()> {
-        self.rx_channel(dir, chan)?;
+        self.check_channel(dir, chan)?;
         gain_name(name)?;
         let mut state = self.state()?;
-        state.gains[chan] =
-            self.shared
-                .session
-                .codec()
-                .set_gain(CodecDirection::Rx, self.chain(chan), gain)?;
+        let actual = self.shared.session.codec().set_gain(
+            codec_direction(dir),
+            self.chain(chan),
+            if dir == Direction::Tx && gain.is_finite() {
+                gain.clamp(0.0, ad936x::MAX_GAIN)
+            } else {
+                gain
+            },
+        )?;
+        if dir == Direction::Rx {
+            state.gains[chan] = actual;
+        } else {
+            state.tx_gains[chan] = actual;
+        }
         Ok(())
     }
     fn gain(&self, dir: Direction, chan: usize, name: Option<&str>) -> Result<f64> {
-        self.rx_channel(dir, chan)?;
+        self.check_channel(dir, chan)?;
         gain_name(name)?;
         let state = self.state()?;
-        if state.agc[chan] {
+        if dir == Direction::Rx && state.agc[chan] {
             return Err(Error::not_supported(
                 "reading instantaneous gain during AGC",
             ));
         }
-        Ok(state.gains[chan])
+        Ok(if dir == Direction::Rx {
+            state.gains[chan]
+        } else {
+            state.tx_gains[chan]
+        })
     }
     fn gain_range(&self, dir: Direction, chan: usize, name: Option<&str>) -> Result<Range> {
-        self.rx_channel(dir, chan)?;
+        self.check_channel(dir, chan)?;
         gain_name(name)?;
-        Ok(Range::new(0.0, 76.0, 1.0))
+        Ok(if dir == Direction::Rx {
+            Range::new(0.0, 76.0, 1.0)
+        } else {
+            Range::new(0.0, ad936x::MAX_GAIN, 0.25)
+        })
     }
     fn set_agc(&self, dir: Direction, chan: usize, enable: bool) -> Result<()> {
-        self.rx_channel(dir, chan)?;
+        self.check_channel(dir, chan)?;
+        if dir == Direction::Tx {
+            return Err(Error::not_supported("TX AGC"));
+        }
         let mut state = self.state()?;
         self.shared
             .session
@@ -420,46 +503,65 @@ impl Device for B200Device {
         Ok(())
     }
     fn set_bandwidth(&self, dir: Direction, chan: usize, bandwidth: f64) -> Result<f64> {
-        self.rx_channel(dir, chan)?;
+        self.check_channel(dir, chan)?;
         let mut state = self.state()?;
         let actual = self
             .shared
             .session
             .codec()
-            .set_bandwidth(CodecDirection::Rx, bandwidth)?;
-        state.bandwidth = Some(actual);
+            .set_bandwidth(codec_direction(dir), bandwidth)?;
+        if dir == Direction::Rx {
+            state.bandwidth = Some(actual);
+        } else {
+            state.tx_bandwidth = Some(actual);
+        }
         Ok(actual)
     }
     fn bandwidth(&self, dir: Direction, chan: usize) -> Result<f64> {
-        self.rx_channel(dir, chan)?;
+        self.check_channel(dir, chan)?;
         let _state = self.state()?;
-        Ok(self.shared.session.codec().bandwidth(CodecDirection::Rx))
+        Ok(self.shared.session.codec().bandwidth(codec_direction(dir)))
     }
     fn bandwidth_range(&self, dir: Direction, chan: usize) -> Result<MetaRange> {
-        self.rx_channel(dir, chan)?;
+        self.check_channel(dir, chan)?;
         Ok(Range::continuous(ad936x::MIN_BW, ad936x::MAX_BW).into())
     }
     fn antennas(&self, dir: Direction, chan: usize) -> Result<Vec<String>> {
-        self.rx_channel(dir, chan)?;
-        Ok(vec!["RX2".into(), "TX/RX".into()])
+        self.check_channel(dir, chan)?;
+        Ok(if dir == Direction::Rx {
+            vec!["RX2".into(), "TX/RX".into()]
+        } else {
+            vec!["TX/RX".into()]
+        })
     }
     fn set_antenna(&self, dir: Direction, chan: usize, antenna: &str) -> Result<()> {
-        self.rx_channel(dir, chan)?;
+        self.check_channel(dir, chan)?;
         let antenna = RxAntenna::parse(antenna)?;
+        if dir == Direction::Tx {
+            return if antenna == RxAntenna::TxRx {
+                Ok(())
+            } else {
+                Err(Error::invalid_arg("TX antenna must be TX/RX"))
+            };
+        }
         let mut state = self.state()?;
         let session = &self.shared.session;
         session.atr(chan)?.set_b2xx_states(
             crate::rx_stream::side_for(chan, session.misc().swap_atr()),
-            state.stream_channel == Some(chan),
-            false,
+            state.stream_channel == Some((Direction::Rx, chan)),
+            state.stream_channel == Some((Direction::Tx, chan)),
             antenna == RxAntenna::Rx2,
         )?;
         state.antennas[chan] = antenna;
         Ok(())
     }
     fn antenna(&self, dir: Direction, chan: usize) -> Result<String> {
-        self.rx_channel(dir, chan)?;
-        Ok(self.state()?.antennas[chan].name().into())
+        self.check_channel(dir, chan)?;
+        Ok(if dir == Direction::Rx {
+            self.state()?.antennas[chan].name().into()
+        } else {
+            "TX/RX".into()
+        })
     }
     fn clock_sources(&self, mboard: usize) -> Result<Vec<String>> {
         self.mboard(mboard)?;
@@ -550,7 +652,7 @@ impl Device for B200Device {
                 Ok(vec!["ref_locked".into()])
             }
             SensorScope::Channel { dir, chan } => {
-                self.rx_channel(dir, chan)?;
+                self.check_channel(dir, chan)?;
                 Ok(vec!["lo_locked".into()])
             }
         }
@@ -566,11 +668,14 @@ impl Device for B200Device {
                 self.shared.session.misc().ref_locked()?
             }
             SensorScope::Channel { dir, chan } => {
-                self.rx_channel(dir, chan)?;
+                self.check_channel(dir, chan)?;
                 if name != "lo_locked" {
                     return Err(Error::KeyNotFound(name.into()));
                 }
-                self.shared.session.misc().fe_pll_locked()?.1
+                {
+                    let (tx, rx) = self.shared.session.misc().fe_pll_locked()?;
+                    if dir == Direction::Rx { rx } else { tx }
+                }
             }
         };
         Ok(SensorValue {
@@ -589,21 +694,38 @@ impl Device for B200Device {
                 ));
             }
         };
-        self.rx_channel(Direction::Rx, chan)?;
+        self.check_channel(Direction::Rx, chan)?;
         let mut state = self.state()?;
         state.require_idle()?;
         let options = RxOptions::new(state.dsp[chan].host_rate())
             .with_dsp_freq(state.dsp[chan].freq())
             .with_antenna(state.antennas[chan]);
         let rx = self.shared.session.rx_stream(&options, args)?;
-        state.stream_channel = Some(chan);
+        state.stream_channel = Some((Direction::Rx, chan));
         Ok(Box::new(ManagedRx {
             rx: Some(rx),
             shared: Arc::clone(&self.shared),
         }))
     }
-    fn open_tx_stream(&self, _args: &StreamArgs) -> Result<Box<dyn RawTxStreamer>> {
-        Err(Error::not_supported("B2xx transmit streaming"))
+    fn open_tx_stream(&self, args: &StreamArgs) -> Result<Box<dyn RawTxStreamer>> {
+        let chan = match args.channels.as_slice() {
+            [] => 0,
+            [chan] => *chan,
+            _ => return Err(Error::not_supported("multi-channel B2xx transmit")),
+        };
+        self.check_channel(Direction::Tx, chan)?;
+        let mut state = self.state()?;
+        state.require_idle()?;
+        let options = TxOptions {
+            rate: state.tx_dsp[chan].host_rate(),
+            dsp_freq: state.tx_dsp[chan].freq(),
+        };
+        let tx = self.shared.session.tx_stream(&options, args)?;
+        state.stream_channel = Some((Direction::Tx, chan));
+        Ok(Box::new(ManagedTx {
+            tx: Some(tx),
+            shared: Arc::clone(&self.shared),
+        }))
     }
 }
 
@@ -645,6 +767,41 @@ impl Drop for ManagedRx {
         // Finish USB cancellation and hardware cleanup before allowing a new
         // streamer or a clock change. The session stays alive throughout.
         drop(self.rx.take());
+        state.stream_channel = None;
+    }
+}
+
+#[derive(Debug)]
+struct ManagedTx {
+    tx: Option<B200TxStreamer>,
+    shared: Arc<Shared>,
+}
+
+impl RawTxStreamer for ManagedTx {
+    fn num_channels(&self) -> usize {
+        1
+    }
+    fn max_num_samps(&self) -> usize {
+        self.tx.as_ref().unwrap().max_num_samps()
+    }
+    fn host_format(&self) -> SampleFormat {
+        self.tx.as_ref().unwrap().host_format()
+    }
+    fn wire_format(&self) -> SampleFormat {
+        SampleFormat::Sc16
+    }
+    fn send_raw(&mut self, buffs: &[&[u8]], timeout: Duration, md: &TxMetadata) -> Result<usize> {
+        self.tx.as_mut().unwrap().send_raw(buffs, timeout, md)
+    }
+    fn recv_async_msg(&mut self, timeout: Duration) -> Result<Option<AsyncMetadata>> {
+        self.tx.as_mut().unwrap().recv_async_msg(timeout)
+    }
+}
+
+impl Drop for ManagedTx {
+    fn drop(&mut self) {
+        let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        drop(self.tx.take());
         state.stream_channel = None;
     }
 }

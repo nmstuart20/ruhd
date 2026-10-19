@@ -4,7 +4,7 @@
 //! The receive loop is `benchmark_rx_rate` translated: it pulls samples into
 //! a buffer that is thrown away, counts overflows, sequence errors, dropped
 //! samples, late commands and timeouts, and prints the same summary block.
-//! Transmit is not implemented yet, so the TX lines of that block are always
+//! This benchmark measures receive only, so the TX lines of that block are always
 //! zero.
 
 use std::process::ExitCode;

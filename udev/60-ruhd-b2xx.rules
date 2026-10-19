@@ -1,7 +1,7 @@
 # udev rules: let ordinary users open USRP B2xx devices.
 #
-# Install with `just udev-install`, then replug the board. See "USB
-# permissions" in README.md. Not needed if your distro's UHD package already
+# Install with `just udev-install`, then replug the board. See
+# docs/hardware.md. Not needed if your distro's UHD package already
 # installed its own rule (usually /usr/lib/udev/rules.d/10-usrp-uhd.rules).
 #
 # Each rule grants access two ways:

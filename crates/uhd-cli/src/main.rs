@@ -5,6 +5,7 @@ mod benchmark;
 mod images;
 mod rx;
 mod sigmf;
+mod tx;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -90,6 +91,8 @@ enum Command {
     /// layout UHD's `rx_samples_to_file` writes. Build with `--release` for
     /// sample rates above a few MS/s.
     Rx(rx::RxArgs),
+    /// Transmit raw IQ samples from a file or stdin. Use a release build.
+    Tx(tx::TxArgs),
     /// Measure receive streaming throughput, like UHD's `benchmark_rate`.
     ///
     /// Streams at `--rx-rate` for `--duration` seconds into a buffer that is
@@ -323,6 +326,7 @@ fn run(command: &Command) -> Result<()> {
         Command::Doctor(args) => doctor(args),
         Command::Reset { serial } => reset(serial.as_deref()),
         Command::Rx(args) => rx::run(args),
+        Command::Tx(args) => tx::run(args),
         Command::Benchmark(args) => benchmark::run(args).map(|_| ()),
         Command::Images { action } => match action {
             ImagesAction::Status => images_status(),
