@@ -5,6 +5,8 @@ mod benchmark;
 mod benchmark_metrics;
 mod images;
 mod rx;
+mod rx_backlog;
+mod rx_profile;
 mod rx_stats;
 mod sigmf;
 mod tx;

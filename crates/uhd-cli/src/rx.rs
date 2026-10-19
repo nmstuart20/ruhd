@@ -17,12 +17,14 @@ use std::time::{Duration, Instant, SystemTime};
 use clap::{Args, ValueEnum};
 use uhd_b200::RxAntenna;
 use uhd_core::metadata::{RxError, RxMetadata};
-use uhd_core::stream::{RawRxStreamer, StreamArgs, StreamCmd};
+use uhd_core::stream::{RawRxStreamer, StreamCmd};
 use uhd_core::{
     DeviceArgs, Direction, Error, Result, SampleFormat, SensorData, SensorScope, TuneRequest,
     registry,
 };
 
+use crate::rx_backlog::{Backlog, Snapshot};
+use crate::rx_profile::{RxConfig, RxProfile};
 use crate::rx_stats::LossStats;
 use crate::sigmf::{self, Event, EventKind, Recording};
 
@@ -30,12 +32,6 @@ use crate::sigmf::{self, Event, EventKind, Recording};
 const FIRST_TIMEOUT: Duration = Duration::from_secs(1);
 /// How long a running stream may go quiet before it counts as stalled.
 const RUNNING_TIMEOUT: Duration = Duration::from_millis(500);
-/// Bytes per block handed to the writer thread.
-const BLOCK_BYTES: usize = 2 << 20;
-/// Blocks in flight between the receive loop and the writer: 64 MiB, about a
-/// quarter of a second at the AD936x's full rate, for the disk to stall in
-/// before the receive loop has to wait for it.
-const BLOCKS: usize = 32;
 
 #[derive(Debug, Args)]
 pub(crate) struct RxArgs {
@@ -82,11 +78,14 @@ pub(crate) struct RxArgs {
     /// Sample type in the file.
     #[arg(long = "type", value_enum, default_value_t = FileType::Sc16)]
     file_type: FileType,
-    /// Samples per packet. Defaults to as many as fit in a USB frame.
+    /// Coordinated packet size, USB transfer count, application block size,
+    /// and buffer pool. Defaults to low-latency for stdout, capture for files.
+    #[arg(long, value_enum)]
+    profile: Option<RxProfile>,
+    /// Samples per packet; overrides the profile (capped by the USB frame).
     #[arg(long)]
     spp: Option<usize>,
-    /// USB transfers kept queued with the kernel. More gives the host longer
-    /// to fall behind before the FPGA's buffer overflows.
+    /// USB transfers kept queued with the kernel; overrides the profile.
     #[arg(long)]
     num_recv_frames: Option<usize>,
     /// Seconds to wait after tuning before streaming, for the LO and the
@@ -96,6 +95,21 @@ pub(crate) struct RxArgs {
     /// Only the device with this serial.
     #[arg(long)]
     serial: Option<String>,
+}
+
+impl RxArgs {
+    fn config(&self) -> Result<RxConfig> {
+        self.profile
+            .unwrap_or_else(|| {
+                if is_stdout(&self.file) {
+                    RxProfile::LowLatency
+                } else {
+                    RxProfile::Capture
+                }
+            })
+            .config()
+            .with_overrides(self.spp, self.num_recv_frames)
+    }
 }
 
 /// Sample type written to the file.
@@ -143,6 +157,9 @@ struct Tally {
     started: Option<SystemTime>,
     /// The reader at the other end of the output went away.
     output_closed: bool,
+    backlog: Snapshot,
+    pool_waits: u64,
+    pool_wait: Duration,
 }
 
 impl Tally {
@@ -177,6 +194,7 @@ pub(crate) fn stop_on_ctrl_c() -> Result<Arc<AtomicBool>> {
 
 pub(crate) fn run(args: &RxArgs) -> Result<()> {
     // Checked before the device is touched, so a typo costs nothing.
+    let config = args.config()?;
     if let Some(secs) = args.duration
         && !(secs.is_finite() && secs > 0.0)
     {
@@ -222,14 +240,7 @@ pub(crate) fn run(args: &RxArgs) -> Result<()> {
     let antenna = device.antenna(Direction::Rx, 0)?;
     eprintln!("Using Device: {info}");
 
-    let mut stream_args = StreamArgs::new();
-    stream_args.host_format = args.file_type.format();
-    if let Some(spp) = args.spp {
-        stream_args = stream_args.with_arg("spp", spp.to_string());
-    }
-    if let Some(frames) = args.num_recv_frames {
-        stream_args = stream_args.with_arg("num_recv_frames", frames.to_string());
-    }
+    let stream_args = config.stream_args(args.file_type.format());
     let mut rx = device.open_rx_stream(&stream_args)?;
 
     eprintln!("  master clock: {:.6} MHz", tick_rate / 1e6);
@@ -247,6 +258,7 @@ pub(crate) fn run(args: &RxArgs) -> Result<()> {
         args.file_type.format().name(),
         rx.max_num_samps()
     );
+    config.report(args.file_type.format(), rate, rx.max_num_samps());
 
     std::thread::sleep(Duration::from_secs_f64(args.setup_time.max(0.0)));
     let locked = device.sensor(
@@ -275,7 +287,7 @@ pub(crate) fn run(args: &RxArgs) -> Result<()> {
         Box::new(File::create(&args.file)?)
     };
     let mut tally = Tally::default();
-    let result = record(rx.as_mut(), out, total, &stop, &mut tally);
+    let result = record(rx.as_mut(), out, total, &stop, &mut tally, config, rate);
     drop(rx);
 
     let target = if is_stdout(&args.file) {
@@ -283,10 +295,11 @@ pub(crate) fn run(args: &RxArgs) -> Result<()> {
     } else {
         args.file.display().to_string()
     };
-    let bytes = tally.samples * (args.file_type.format().bits_per_sample() / 8) as u64;
+    let bytes = tally.backlog.written;
+    let written_samples = bytes / (args.file_type.format().bits_per_sample() / 8) as u64;
     eprintln!(
         "Wrote {} samples ({:.1} MB) to {target}",
-        tally.samples,
+        written_samples,
         bytes as f64 / 1e6,
     );
     if tally.output_closed {
@@ -358,21 +371,38 @@ fn record(
     total: Option<u64>,
     stop: &AtomicBool,
     tally: &mut Tally,
+    config: RxConfig,
+    rate: f64,
 ) -> Result<()> {
     let host_bytes = rx.host_format().bits_per_sample() / 8;
-    let block_samples = BLOCK_BYTES / host_bytes;
+    let block_samples = config.block_samples(rx.host_format());
+    let backlog = Arc::new(Backlog::default());
+
+    // Keep reporting even when the receive loop or writer is blocked.
+    let (monitor_stop, monitor_rx) = mpsc::channel::<()>();
+    let monitor_backlog = Arc::clone(&backlog);
+    let monitor = std::thread::spawn(move || {
+        while matches!(
+            monitor_rx.recv_timeout(Duration::from_secs(1)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ) {
+            monitor_backlog.snapshot().report(host_bytes, rate);
+        }
+    });
 
     let (full_tx, full_rx) = mpsc::channel::<(Vec<u8>, usize)>();
     let (empty_tx, empty_rx) = mpsc::channel::<Vec<u8>>();
-    for _ in 0..BLOCKS {
+    for _ in 0..config.blocks {
         empty_tx
             .send(vec![0u8; block_samples * host_bytes])
-            .map_err(|_| Error::Internal("block pool closed".into()))?;
+            .expect("block pool receiver is still open");
     }
+    let writer_backlog = Arc::clone(&backlog);
     let writer = std::thread::spawn(move || -> io::Result<()> {
         let mut out = out;
         for (block, len) in full_rx {
             out.write_all(&block[..len])?;
+            writer_backlog.written(len);
             // The receive loop may already have finished; a closed pool is fine.
             empty_tx.send(block).ok();
         }
@@ -388,11 +418,20 @@ fn record(
         &empty_rx,
         &full_tx,
         tally,
+        &backlog,
     );
     drop(full_tx);
-    let written = writer
-        .join()
-        .map_err(|_| Error::Internal("the file writer thread panicked".into()))?;
+    let written = writer.join();
+    drop(monitor_stop);
+    let _ = monitor.join();
+    tally.backlog = backlog.snapshot();
+    tally.backlog.report(host_bytes, rate);
+    eprintln!(
+        "  buffer pool exhausted {} time(s), {:.3} ms waiting for output",
+        tally.pool_waits,
+        tally.pool_wait.as_secs_f64() * 1000.0,
+    );
+    let written = written.map_err(|_| Error::Internal("the file writer thread panicked".into()))?;
     match written {
         // A pipe whose reader exits (`ruhd rx -f - | head -c 1M`) is a normal
         // way for a recording to end, not a failure. The receive loop will
@@ -421,6 +460,7 @@ fn stream_blocks(
     empty: &mpsc::Receiver<Vec<u8>>,
     full: &mpsc::Sender<(Vec<u8>, usize)>,
     tally: &mut Tally,
+    backlog: &Backlog,
 ) -> Result<()> {
     if stop.load(Ordering::SeqCst) {
         return Ok(());
@@ -438,6 +478,7 @@ fn stream_blocks(
         empty,
         full,
         tally,
+        backlog,
     );
     let stopped = rx.issue_stream_cmd(&StreamCmd::stop());
 
@@ -464,6 +505,7 @@ fn pump(
     empty: &mpsc::Receiver<Vec<u8>>,
     full: &mpsc::Sender<(Vec<u8>, usize)>,
     tally: &mut Tally,
+    backlog: &Backlog,
 ) -> Result<()> {
     let mut md = RxMetadata::default();
     let closed = || Error::Internal("the file writer stopped early".into());
@@ -554,11 +596,39 @@ fn pump(
         }
         filled += n;
         tally.samples += n as u64;
+        backlog.received(n * host_bytes);
         if filled == block_samples {
             full.send((block, filled * host_bytes))
                 .map_err(|_| closed())?;
             filled = 0;
-            block = empty.recv().map_err(|_| closed())?;
+            // Do not wait on a slow writer before checking a finite limit or
+            // Ctrl-C. Polling also makes Ctrl-C responsive under backpressure.
+            if remaining(tally) == 0 || stop.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            block = match empty.try_recv() {
+                Ok(block) => block,
+                Err(mpsc::TryRecvError::Disconnected) => return Err(closed()),
+                Err(mpsc::TryRecvError::Empty) => {
+                    tally.pool_waits += 1;
+                    let waiting = Instant::now();
+                    let next = loop {
+                        if stop.load(Ordering::SeqCst) {
+                            break Ok(None);
+                        }
+                        match empty.recv_timeout(Duration::from_millis(50)) {
+                            Ok(block) => break Ok(Some(block)),
+                            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                            Err(mpsc::RecvTimeoutError::Disconnected) => break Err(closed()),
+                        }
+                    };
+                    tally.pool_wait += waiting.elapsed();
+                    match next? {
+                        Some(block) => block,
+                        None => return Ok(()),
+                    }
+                }
+            };
         }
     };
     // Keep samples from earlier receives even when the next receive fails.
@@ -574,17 +644,94 @@ fn pump(
 mod tests {
     use super::*;
     use crate::test_support::ScriptedRx;
+    use clap::Parser;
     use std::sync::Mutex;
     use uhd_core::{RxLoss, RxLossCause};
+
+    const BLOCK_BYTES: usize = 2 << 20;
+
+    fn record(
+        rx: &mut dyn RawRxStreamer,
+        out: Box<dyn Write + Send>,
+        total: Option<u64>,
+        stop: &AtomicBool,
+        tally: &mut Tally,
+    ) -> Result<()> {
+        super::record(
+            rx,
+            out,
+            total,
+            stop,
+            tally,
+            RxProfile::Capture.config(),
+            1e6,
+        )
+    }
+
+    fn parse_rx(extra: &[&str]) -> RxArgs {
+        let cli = crate::Cli::try_parse_from(
+            ["ruhd", "rx", "--freq", "100e6"]
+                .into_iter()
+                .chain(extra.iter().copied()),
+        )
+        .unwrap();
+        let crate::Command::Rx(args) = cli.command else {
+            unreachable!()
+        };
+        args
+    }
+
+    #[test]
+    fn profiles_follow_output_target_and_explicit_settings_win() {
+        assert_eq!(
+            parse_rx(&["-f", "-"]).config().unwrap().profile,
+            RxProfile::LowLatency
+        );
+        assert_eq!(
+            parse_rx(&["-f", "capture.sc16"]).config().unwrap().profile,
+            RxProfile::Capture
+        );
+        let config = parse_rx(&[
+            "-f",
+            "-",
+            "--profile",
+            "balanced",
+            "--spp",
+            "99",
+            "--num-recv-frames",
+            "7",
+        ])
+        .config()
+        .unwrap();
+        assert_eq!(config.profile, RxProfile::Balanced);
+        assert_eq!(config.spp, 99);
+        assert_eq!(config.transfers, 7);
+        assert_eq!(config.block_bytes * config.blocks, 2 << 20);
+        assert_eq!(
+            parse_rx(&["-f", "out", "--profile", "low-latency"])
+                .config()
+                .unwrap()
+                .profile,
+            RxProfile::LowLatency
+        );
+        assert!(parse_rx(&["-f", "-", "--spp", "0"]).config().is_err());
+        assert!(
+            parse_rx(&["-f", "-", "--num-recv-frames", "1"])
+                .config()
+                .is_err()
+        );
+    }
 
     #[derive(Clone, Default)]
     struct Capture {
         bytes: Arc<Mutex<Vec<u8>>>,
+        writes: Arc<Mutex<Vec<usize>>>,
         flushed: Arc<AtomicBool>,
     }
 
     impl Write for Capture {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.writes.lock().unwrap().push(bytes.len());
             self.bytes.lock().unwrap().extend_from_slice(bytes);
             Ok(bytes.len())
         }
@@ -593,6 +740,142 @@ mod tests {
             self.flushed.store(true, Ordering::SeqCst);
             Ok(())
         }
+    }
+
+    #[test]
+    fn each_profile_delivers_its_block_size_and_flushes_the_tail() {
+        for profile in [
+            RxProfile::LowLatency,
+            RxProfile::Balanced,
+            RxProfile::Capture,
+        ] {
+            let config = profile.config();
+            let bytes = config.block_bytes;
+            let mut rx = ScriptedRx::new([
+                Ok((vec![1; bytes / 2], RxMetadata::default())),
+                Ok((vec![2; bytes / 2], RxMetadata::default())),
+                Ok((vec![3; bytes], RxMetadata::default())),
+                Ok((vec![4; 12], RxMetadata::default())),
+            ]);
+            let capture = Capture::default();
+            let mut tally = Tally::default();
+            super::record(
+                &mut rx,
+                Box::new(capture.clone()),
+                Some((bytes as u64 * 2 + 12) / 4),
+                &AtomicBool::new(false),
+                &mut tally,
+                config,
+                1e6,
+            )
+            .unwrap();
+            assert_eq!(*capture.writes.lock().unwrap(), [bytes, bytes, 12]);
+            assert_eq!(
+                *capture.bytes.lock().unwrap(),
+                [
+                    vec![1; bytes / 2],
+                    vec![2; bytes / 2],
+                    vec![3; bytes],
+                    vec![4; 12]
+                ]
+                .concat()
+            );
+            assert_eq!(tally.backlog.pending, 0);
+            assert_eq!(tally.backlog.written, bytes as u64 * 2 + 12);
+            assert!(tally.backlog.peak <= bytes * config.blocks);
+        }
+    }
+
+    #[test]
+    fn stalled_writer_exposes_full_backlog_and_stop_does_not_need_a_free_block() {
+        let config = RxProfile::LowLatency.config();
+        let mut rx = ScriptedRx::new(
+            (0..config.blocks).map(|_| Ok((vec![7; config.block_bytes], RxMetadata::default()))),
+        );
+        let backlog = Backlog::default();
+        let stop = AtomicBool::new(false);
+        let mut tally = Tally::default();
+        let (empty_tx, empty_rx) = mpsc::channel();
+        let (full_tx, full_rx) = mpsc::channel();
+        for _ in 0..config.blocks {
+            empty_tx.send(vec![0; config.block_bytes]).unwrap();
+        }
+        std::thread::scope(|scope| {
+            let rx = &mut rx;
+            let tally = &mut tally;
+            let stop = &stop;
+            let backlog = &backlog;
+            let pump = scope.spawn(move || {
+                stream_blocks(
+                    rx,
+                    None,
+                    stop,
+                    config.block_bytes / 4,
+                    4,
+                    &empty_rx,
+                    &full_tx,
+                    tally,
+                    backlog,
+                )
+            });
+            // Deliberately hold all blocks without confirming any writes.
+            for _ in 0..config.blocks {
+                let (_, len) = full_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                assert_eq!(len, config.block_bytes);
+            }
+            assert_eq!(
+                backlog.snapshot().pending,
+                config.block_bytes * config.blocks
+            );
+            assert_eq!(backlog.snapshot().peak, config.block_bytes * config.blocks);
+            assert_eq!(backlog.snapshot().written, 0);
+            stop.store(true, Ordering::SeqCst);
+            pump.join().unwrap().unwrap();
+        });
+        assert_eq!(
+            tally.samples as usize,
+            config.block_bytes * config.blocks / 4
+        );
+        assert_eq!(
+            rx.commands,
+            [StreamCmd::start_continuous(), StreamCmd::stop()]
+        );
+        backlog.written(config.block_bytes);
+        assert_eq!(
+            backlog.snapshot().pending,
+            config.block_bytes * (config.blocks - 1)
+        );
+        assert_eq!(backlog.snapshot().peak, config.block_bytes * config.blocks);
+    }
+
+    #[test]
+    fn broken_pipe_retains_unwritten_backlog_and_stops_cleanly() {
+        struct Closed;
+        impl Write for Closed {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut rx = ScriptedRx::new([Ok((vec![1; 12], RxMetadata::default()))]);
+        let mut tally = Tally::default();
+        record(
+            &mut rx,
+            Box::new(Closed),
+            Some(3),
+            &AtomicBool::new(false),
+            &mut tally,
+        )
+        .unwrap();
+        assert!(tally.output_closed);
+        assert_eq!(tally.backlog.pending, 12);
+        assert_eq!(tally.backlog.written, 0);
+        assert_eq!(
+            rx.commands,
+            [StreamCmd::start_continuous(), StreamCmd::stop()]
+        );
     }
 
     #[test]
@@ -735,6 +1018,9 @@ mod tests {
         assert_eq!(*capture.bytes.lock().unwrap(), expected);
         assert!(capture.flushed.load(Ordering::SeqCst));
         assert_eq!(tally.samples, 3);
+        assert_eq!(tally.backlog.pending, 0);
+        assert_eq!(tally.backlog.peak, 12);
+        assert_eq!(tally.backlog.written, 12);
         assert!(tally.events.is_empty());
         assert_eq!(
             rx.commands,
