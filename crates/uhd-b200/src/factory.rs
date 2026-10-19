@@ -27,10 +27,52 @@ impl DeviceFactory for B200Factory {
     }
 
     fn open(&self, args: &DeviceArgs) -> Result<Arc<dyn Device>> {
-        Err(Error::not_supported(format!(
-            "opening `{args}` through uhd_core::Device (B2xx discovery is implemented, but the \
-             generic Device and streamer implementation is not yet complete)"
-        )))
+        let auto_flash = args.get_or("auto_flash", false)?;
+        crate::device::validate_open_args(args)?;
+        let found = find(args)?;
+        let info = match found.as_slice() {
+            [] => return Err(Error::NoDeviceFound(args.clone())),
+            [info] => info,
+            more => {
+                return Err(Error::AmbiguousDevice {
+                    hint: args.clone(),
+                    count: more.len(),
+                });
+            }
+        };
+        // Use the complete discovery predicate again, including the physical
+        // address fallback for boards whose EEPROM has no serial.
+        let filter = UsbFilter {
+            serial: (!info.serial.is_empty()).then(|| info.serial.clone()),
+            vid: hex_u16_arg(&info.args, "vid")?,
+            pid: hex_u16_arg(&info.args, "pid")?,
+        };
+        let mut probes = usb::probe_filtered(&filter)?;
+        let bus = decimal_u8_arg(&info.args, "bus")?;
+        let address = decimal_u8_arg(&info.args, "address")?;
+        probes.retain(|p| {
+            p.state == DeviceState::Ready
+                && bus.is_none_or(|b| p.endpoint.bus == Some(b))
+                && address.is_none_or(|a| p.endpoint.address == Some(a))
+        });
+        let probe = match probes.as_slice() {
+            [] => return Err(Error::NoDeviceFound(args.clone())),
+            [probe] => probe,
+            more => {
+                return Err(Error::AmbiguousDevice {
+                    hint: args.clone(),
+                    count: more.len(),
+                });
+            }
+        };
+        let catalog = crate::UhdImagesCatalog::builtin()?;
+        let session = crate::open_probed(
+            probe,
+            &crate::OpenOptions::new().with_auto_flash(auto_flash),
+            &catalog,
+            |_, _| {},
+        )?;
+        Ok(Arc::new(crate::B200Device::from_session(session, args)?))
     }
 }
 
@@ -117,7 +159,7 @@ pub fn find(hint: &DeviceArgs) -> Result<Vec<DeviceInfo>> {
     Ok(found)
 }
 
-fn device_info(
+pub(crate) fn device_info(
     endpoint: &UsbEndpoint,
     product: Option<B2xxProduct>,
     descriptor_serial: Option<&str>,

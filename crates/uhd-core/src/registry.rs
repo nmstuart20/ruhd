@@ -100,6 +100,8 @@ impl Registry {
     ///
     /// Returns [`Error::NoDeviceFound`] if nothing matched and
     /// [`Error::AmbiguousDevice`] if more than one did.
+    /// The factory receives the discovered identity together with the caller's
+    /// remaining options, such as a requested master clock rate.
     pub fn open(&self, args: &DeviceArgs) -> Result<Arc<dyn Device>> {
         let candidates = self.find(args)?;
         match candidates.len() {
@@ -116,7 +118,11 @@ impl Registry {
                             info.device_type
                         ))
                     })?;
-                factory.open(&info.args)
+                // Discovery supplies the canonical identity; retain options
+                // such as master_clock_rate that are not discovery predicates.
+                let mut resolved = info.args.clone();
+                resolved.merge_defaults(args);
+                factory.open(&resolved)
             }
             count => Err(Error::AmbiguousDevice {
                 hint: args.clone(),
@@ -275,6 +281,39 @@ mod tests {
         // hint resolved to exactly one device and dispatch found its factory.
         let err = registry().open(&hint).unwrap_err();
         assert!(matches!(err, Error::NotSupported(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn open_preserves_options_and_uses_the_discovered_identity() {
+        #[derive(Debug)]
+        struct CaptureFactory(std::sync::Mutex<Option<DeviceArgs>>);
+        impl DeviceFactory for CaptureFactory {
+            fn device_type(&self) -> &'static str {
+                "b200"
+            }
+            fn find(&self, _hint: &DeviceArgs) -> Result<Vec<DeviceInfo>> {
+                Ok(vec![DeviceInfo {
+                    device_type: "b200".into(),
+                    args: "type=b200,serial=CANONICAL".parse().unwrap(),
+                    ..Default::default()
+                }])
+            }
+            fn open(&self, args: &DeviceArgs) -> Result<Arc<dyn Device>> {
+                *self.0.lock().unwrap() = Some(args.clone());
+                Err(Error::not_supported("capture only"))
+            }
+        }
+        let factory = Arc::new(CaptureFactory(std::sync::Mutex::new(None)));
+        let mut registry = Registry::new();
+        registry.register(factory.clone());
+        let hint = "type=B200,serial=canonical,master_clock_rate=40e6,auto_flash=true"
+            .parse()
+            .unwrap();
+        assert!(matches!(registry.open(&hint), Err(Error::NotSupported(_))));
+        assert_eq!(
+            factory.0.lock().unwrap().as_ref().unwrap().to_string(),
+            "auto_flash=true,master_clock_rate=40e6,serial=CANONICAL,type=b200"
+        );
     }
 
     #[test]

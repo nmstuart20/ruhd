@@ -9,7 +9,8 @@ works against real hardware: `ruhd probe usb` finds and classifies a B2xx, and
 configured, and a live settings bus. Stock `uhd_usrp_probe` then opens the same
 device without reloading anything. `ruhd find` discovers firmware-ready B2xx
 devices, and `ruhd rx` records IQ from one (single channel, receive only). The
-generic `Device` implementation and transmit are not done yet. See
+B2xx backend exposes receive configuration and streaming through the generic
+`Device` API. Transmit is not implemented yet. See
 [NOTES.md](NOTES.md) for the design rationale, the reference material, and the
 plan.
 
@@ -21,7 +22,7 @@ plan.
 | `uhd-transport` | Link, register and serial-bus traits; USB discovery, FX3 firmware and FPGA loading, the EEPROM map and settings-bus access (`usb`); image path resolution (`images`). |
 | `chdr` | Legacy CVITA/CHDR packet framing: pack, unpack, and a zero-copy header parser. |
 | `ad936x` | AD9361/AD9364 transceiver driver: complete initialization, RF/sample-rate tuning, gain tables and AGC, FIR/analog filters, and DC/quadrature calibration. |
-| `uhd-b200` | B2xx discovery, compatibility policy, open session, settings-bus peripherals, AD936x board integration, and the receive streamer. |
+| `uhd-b200` | B2xx discovery, compatibility policy, open session, settings-bus peripherals, AD936x board integration, the `Device` backend, and the receive streamer. |
 | `uhd-cli` | The `ruhd` binary. |
 
 ## Getting started
@@ -48,6 +49,46 @@ just grep-ref ad9361_set_gain
 ```
 
 It is not needed to build anything.
+
+## Using the Rust API
+
+Register the backend once, then open and configure a device through `uhd-core`:
+
+```rust
+use uhd_core::num_complex::Complex;
+use uhd_core::{DeviceArgs, DeviceExt, Direction, StreamArgs, StreamCmd, registry};
+
+fn main() -> uhd_core::Result<()> {
+    uhd_b200::register();
+    let args: DeviceArgs = "type=b200,serial=3168B41".parse()?;
+    let device = registry::open(&args)?;
+    device.set_sample_rate(Direction::Rx, 0, 2e6)?;
+    device.tune_to(Direction::Rx, 0, 98e6)?;
+    device.set_gain(Direction::Rx, 0, None, 40.0)?;
+    let mut rx = device.rx_stream::<Complex<f32>>(&StreamArgs::new())?;
+    rx.issue_stream_cmd(&StreamCmd::num_samps(10_000))?;
+    // Receive typed samples with rx.recv_one(...).
+    Ok(())
+}
+```
+
+Firmware and a compatible FPGA must already be loaded (`ruhd init`). Opening
+initializes the radio. `master_clock_rate=32e6` fixes the master clock; otherwise
+setting the RX sample rate chooses it automatically. `auto_flash=true` allows
+compatibility negotiation to reload a cached FPGA image. Discovery stays
+read-only. Both `ruhd rx` and `ruhd benchmark` use this same device API.
+
+One single-channel RX streamer may exist per device. Drop it before changing
+sample rates, master clock, reference/time sources, or device time. Tuning,
+gain, bandwidth, AGC and antenna selection can change during reception; these
+changes can disturb samples. On a B210 the RX LO and analog bandwidth are shared
+between channels. TX operations, simultaneous two-channel reception, external
+reference clock configuration, and instantaneous gain readback during AGC are
+not implemented. Streamers keep the session alive after the device handle is
+dropped.
+
+See [the complete receive example](crates/uhd-b200/examples/receive.rs), runnable
+with `cargo run -p uhd-b200 --example receive -- [serial]`.
 
 ## Finding a device
 

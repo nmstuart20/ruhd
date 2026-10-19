@@ -3,6 +3,11 @@
 //! Reference: `reference/uhd/host/lib/usrp/b200/{b200_iface,b200_impl,b200_io_impl}.cpp`
 //! — see `NOTES.md`.
 //!
+//! Register [`B200Factory`] with [`register`] to open [`B200Device`] through
+//! [`uhd_core::registry::open`]. It implements receive configuration and
+//! streaming through [`uhd_core::Device`]; the lower-level [`B200Session`]
+//! remains available for bring-up and diagnostics.
+//!
 //! # Compatibility is negotiated, once, at open time
 //!
 //! A B2xx's FPGA image carries a compatibility major that identifies the
@@ -64,6 +69,7 @@
 pub mod atr;
 pub mod codec;
 pub mod compat;
+pub mod device;
 pub mod factory;
 pub mod misc;
 pub mod policy;
@@ -78,6 +84,7 @@ pub mod time_core;
 pub use atr::{AtrMode, AtrOffsets, AtrReg, AtrStates, GpioAtr, Side};
 pub use codec::client_params;
 pub use compat::{CoreRegs, FpgaCompat, FpgaShim, FullShim, MiniShim, RadioRegs, RefLock};
+pub use device::B200Device;
 pub use factory::{B200Factory, find, register};
 pub use misc::{MiscGpio, RefSel, RxBand, TxBand};
 pub use policy::{

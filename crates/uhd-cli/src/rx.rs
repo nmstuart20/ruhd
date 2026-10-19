@@ -14,12 +14,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime};
 
-use ad936x::{Chain, Direction};
 use clap::{Args, ValueEnum};
-use uhd_b200::{OpenOptions, RxAntenna, RxOptions};
+use uhd_b200::RxAntenna;
 use uhd_core::metadata::{RxError, RxMetadata};
 use uhd_core::stream::{RawRxStreamer, StreamArgs, StreamCmd};
-use uhd_core::{Error, Result, SampleFormat};
+use uhd_core::{
+    DeviceArgs, Direction, Error, Result, SampleFormat, SensorData, SensorScope, TuneRequest,
+    registry,
+};
 
 use crate::sigmf::{self, Event, EventKind, Recording};
 
@@ -187,40 +189,35 @@ pub(crate) fn run(args: &RxArgs) -> Result<()> {
     };
     let stop = stop_on_ctrl_c()?;
 
-    let mut open_options = OpenOptions::new();
+    let mut device_args = DeviceArgs::new().with("type", "b200");
     if let Some(serial) = &args.serial {
-        open_options = open_options.with_serial(serial);
+        device_args.set("serial", serial);
     }
-    let session = uhd_b200::open(&open_options)?;
-
-    let master_clock_rate = match args.master_clock_rate {
-        Some(rate) => rate,
-        None => uhd_b200::auto_master_clock_rate(args.rate, 1)?,
-    };
-    eprintln!(
-        "Initialising {} ({}) at a {:.6} MHz master clock...",
-        session.product(),
-        session.endpoint(),
-        master_clock_rate / 1e6
-    );
-    let tick_rate = session.init_radio(master_clock_rate)?;
-
-    // Radio 0 is the codec's second chain when the board swaps its front ends.
-    let chain = if session.misc().swap_atr() {
-        Chain::Two
-    } else {
-        Chain::One
-    };
-    let codec = session.codec();
-    let freq = codec.tune(Direction::Rx, args.freq)?;
+    if let Some(rate) = args.master_clock_rate {
+        device_args.set("master_clock_rate", rate.to_string());
+    }
+    eprintln!("Initialising device...");
+    let device = registry::open(&device_args)?;
+    let info = device.info();
+    let rate = device.set_sample_rate(Direction::Rx, 0, args.rate)?;
+    let tick_rate = device.master_clock_rate(0)?;
+    let freq = device
+        .tune(Direction::Rx, 0, &TuneRequest::new(args.freq))?
+        .actual_freq();
     let gain = args
         .gain
-        .map(|gain| codec.set_gain(Direction::Rx, chain, gain))
+        .map(|gain| {
+            device.set_gain(Direction::Rx, 0, None, gain)?;
+            device.gain(Direction::Rx, 0, None)
+        })
         .transpose()?;
     let bw = args
         .bw
-        .map(|bw| codec.set_bandwidth(Direction::Rx, bw))
+        .map(|bw| device.set_bandwidth(Direction::Rx, 0, bw))
         .transpose()?;
+    device.set_antenna(Direction::Rx, 0, args.ant.name())?;
+    let antenna = device.antenna(Direction::Rx, 0)?;
+    eprintln!("Using Device: {info}");
 
     let mut stream_args = StreamArgs::new();
     stream_args.host_format = args.file_type.format();
@@ -230,11 +227,7 @@ pub(crate) fn run(args: &RxArgs) -> Result<()> {
     if let Some(frames) = args.num_recv_frames {
         stream_args = stream_args.with_arg("num_recv_frames", frames.to_string());
     }
-    let mut rx = session.rx_stream(
-        &RxOptions::new(args.rate).with_antenna(args.ant),
-        &stream_args,
-    )?;
-    let rate = rx.sample_rate();
+    let mut rx = device.open_rx_stream(&stream_args)?;
 
     eprintln!("  master clock: {:.6} MHz", tick_rate / 1e6);
     eprintln!("  sample rate:  {:.6} MS/s", rate / 1e6);
@@ -245,16 +238,22 @@ pub(crate) fn run(args: &RxArgs) -> Result<()> {
     if let Some(bw) = bw {
         eprintln!("  bandwidth:    {:.6} MHz", bw / 1e6);
     }
-    eprintln!("  antenna:      {}", rx.antenna());
+    eprintln!("  antenna:      {}", antenna);
     eprintln!(
         "  format:       {} ({} samples per packet)",
         args.file_type.format().name(),
-        rx.samples_per_packet()
+        rx.max_num_samps()
     );
 
     std::thread::sleep(Duration::from_secs_f64(args.setup_time.max(0.0)));
-    let (_, rx_locked) = session.misc().fe_pll_locked()?;
-    if !rx_locked {
+    let locked = device.sensor(
+        SensorScope::Channel {
+            dir: Direction::Rx,
+            chan: 0,
+        },
+        "lo_locked",
+    )?;
+    if locked.value == SensorData::Bool(false) {
         eprintln!("warning: the RX LO reports unlocked");
     }
 
@@ -273,8 +272,7 @@ pub(crate) fn run(args: &RxArgs) -> Result<()> {
         Box::new(File::create(&args.file)?)
     };
     let mut tally = Tally::default();
-    let result = record(&mut rx, out, total, &stop, &mut tally);
-    let antenna = rx.antenna().to_string();
+    let result = record(rx.as_mut(), out, total, &stop, &mut tally);
     drop(rx);
 
     let target = if is_stdout(&args.file) {
@@ -302,10 +300,9 @@ pub(crate) fn run(args: &RxArgs) -> Result<()> {
     // Written even when the stream failed part-way, so the samples that did
     // land on disk are still described.
     if let (Some(path), Some(started)) = (meta_path, tally.started) {
-        let hardware = match &session.endpoint().serial {
-            Some(serial) => format!("{} {serial}", session.product()),
-            None => session.product().to_string(),
-        };
+        let hardware = format!("{} {}", info.product, info.serial)
+            .trim()
+            .to_owned();
         let recording = Recording {
             format: args.file_type.format(),
             sample_rate: rate,

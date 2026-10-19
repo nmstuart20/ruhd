@@ -240,7 +240,7 @@ impl RxDsp {
 ///
 /// `get_host_rates` with `is_b200`: steps of 4 above 256, of 2 above 128, and
 /// of 1 down to the link-rate floor.
-fn decimations(tick_rate: f64) -> Vec<u32> {
+pub(crate) fn decimations(tick_rate: f64) -> Vec<u32> {
     let floor = ((tick_rate / LINK_RATE).ceil() as u32).max(1);
     let mut out: Vec<u32> = (257..=512).rev().step_by(4).collect();
     out.extend((129..=256).rev().step_by(2));

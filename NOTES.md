@@ -733,8 +733,8 @@ hardware path is `uhd_transport::usb`, which now takes a device all the way from
 `FpgaCompat` enum and its shims), `policy` (the accept / reload / refuse
 decision), `session` (the open path and the read-only `checkup`), and
 `radio_ctrl` promoted to open against a negotiated major. `ruhd doctor` is the
-CLI front end. Its discovery factory supplies `ruhd find`; it is not yet a
-generic `Device` impl.
+CLI front end. Its factory supplies `ruhd find` and opens the receive-capable
+generic `Device` backend.
 
 On top of that sit the settings-bus peripherals, one module each:
 
@@ -791,8 +791,8 @@ Verified against a B205mini, from a bootloader-state device:
 
 `ruhd find` now registers a B2xx discovery factory and reports firmware-ready
 boards from their motherboard EEPROM without changing device state. The
-factory's generic `Device` open path remains deliberately unsupported until the
-trait implementation below lands.
+factory also opens `B200Device`, which owns the session and exposes RX controls
+and typed streaming through `uhd-core`.
 
 ### Receive streaming
 
@@ -845,13 +845,14 @@ Rough order of work from here:
    rate tuning, gain, filtering, and calibration; hardware validation of the
    full path remains.
 4. `uhd-b200` — discovery/EEPROM identity is done, and single-channel receive
-   streaming works (see above). Still to do: a real `Device` over the open
-   session (so `registry::open` and `DeviceExt::rx_stream` work), the
-   transmit streamer, two-channel B210 receive, the `sc8`/`sc12` wire formats,
-   and the codec data-port loopback self-test UHD runs at init.
+   streaming works (see above). The generic `Device` backend now supports
+   `registry::open` and `DeviceExt::rx_stream`; both receive commands use it.
+   Still to do: the transmit streamer, two-channel B210 receive, the
+   `sc8`/`sc12` wire formats, and the codec data-port loopback self-test UHD
+   runs at init.
 5. ~~`chdr` — packet framing.~~ Done: `pack`, `unpack`, and the zero-copy
    `parse_header` the receive path uses.
-6. `uhd-b200` streamers — first samples.
+6. ~~`uhd-b200` streamers — first RX samples.~~ Done; TX remains.
 
 Step 3 is the one that unblocks the rest: the scratch gate in `hw_compat.rs` and
 the two radio-core modules all become runnable the moment the codec is clocking,
@@ -861,3 +862,41 @@ and `RUHD_HW_RADIO_CLOCKED` can go away with them.
 `uhd_b200::register()`.
 
 [nusb]: https://docs.rs/nusb
+
+## Generic B2xx device backend
+
+`B200Device` owns an initialized `B200Session` and serializes configuration
+through a shared mutex. Its managed RX streamer retains the session until USB
+cancellation and front-end cleanup finish. The streamer claims the device's
+receive interface exclusively. A stop command does not release ownership:
+drop the streamer before changing rates, clocks, device time or time sources.
+Those operations would invalidate cached timestamp or scaling calculations.
+Tuning and antenna updates program the device's DSP/ATR controls directly;
+gain, bandwidth and AGC use the codec under the same configuration lock.
+
+The default clock is automatic; `set_sample_rate` applies the existing B2xx
+clock selection rule. Supplying `master_clock_rate` or calling its setter
+fixes the clock. Clock changes reprogram the DSPs and synchronize the radio
+counters at their previous time in seconds; time spent recalibrating is
+excluded. `Registry::open` keeps caller options while preferring discovery's
+canonical identity, so these settings survive factory dispatch.
+
+RX controls, device time/PPS, lock sensors, and single-channel receive are
+available through `Device`. TX methods, simultaneous B210 two-channel RX,
+external reference clock configuration (including the full-size board's
+ADF4001), and instantaneous AGC gain readback remain unsupported. Channel
+counts describe physical hardware; B210 RX frequency and bandwidth remain
+shared codec settings. `tests/hw_device.rs` exercises the public API and
+`examples/receive.rs` demonstrates typed reception.
+
+Validated on B205mini `3168B41`, FPGA 7.0, USB 3: all three public-device
+hardware tests and all four existing receive tests pass. A 2 MS/s CLI capture
+contains exactly 200,000 `sc16` samples and matching SigMF metadata. A 3 s
+61.44 MS/s `sc16` benchmark reports zero overruns, lost samples, sequence
+errors or timestamp jumps (61.434 MS/s achieved). An `fc32` run at the same
+rate reported one overflow and 61.356 MS/s achieved.
+
+One initial public-API timed-start run measured 1187 ticks late, beyond the
+existing four-output-sample bound. The bound was retained: both subsequent
+complete hardware runs and five additional timed-start runs passed. The
+initial outlier has not been explained or reproduced.

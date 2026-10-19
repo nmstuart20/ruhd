@@ -642,6 +642,16 @@ impl Ad936x {
         }
     }
 
+    /// Last configured analog RF bandwidth, in Hz.
+    #[must_use]
+    pub fn bandwidth(&self, direction: Direction) -> f64 {
+        let state = self.locked();
+        match direction {
+            Direction::Rx => state.rx_analog_bw,
+            Direction::Tx => state.tx_analog_bw,
+        }
+    }
+
     /// Tune an RFPLL and run the frequency-dependent calibrations UHD runs.
     pub fn tune(&self, direction: Direction, value: f64) -> Result<f64> {
         let mut state = self.locked();

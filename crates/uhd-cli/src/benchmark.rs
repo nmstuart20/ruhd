@@ -10,12 +10,10 @@
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use ad936x::Direction;
 use clap::Args;
-use uhd_b200::{OpenOptions, RxOptions};
 use uhd_core::metadata::{RxError, RxMetadata};
 use uhd_core::stream::{RawRxStreamer, StreamArgs, StreamCmd};
-use uhd_core::{Error, Result, TimeSpec};
+use uhd_core::{DeviceArgs, Direction, Error, Result, TimeSpec, TuneRequest, registry};
 
 use crate::rx::FileType;
 
@@ -130,31 +128,24 @@ pub(crate) fn run(args: &BenchmarkArgs) -> Result<ExitCode> {
     let start = Instant::now();
     println!();
     println!("[{}] Creating the usrp device...", stamp(start));
-    let mut open_options = OpenOptions::new();
+    let mut device_args = DeviceArgs::new().with("type", "b200");
     if let Some(serial) = &args.serial {
-        open_options = open_options.with_serial(serial);
+        device_args.set("serial", serial);
     }
-    let session = uhd_b200::open(&open_options)?;
-    println!(
-        "Using Device: {} ({})",
-        session.product(),
-        session.endpoint()
-    );
-
-    let master_clock_rate = match args.master_clock_rate {
-        Some(rate) => rate,
-        None => uhd_b200::auto_master_clock_rate(args.rx_rate, 1)?,
-    };
-    // `init_radio` also zeroes the device clock, which is benchmark_rate's
-    // "Setting device timestamp to 0".
+    if let Some(rate) = args.master_clock_rate {
+        device_args.set("master_clock_rate", rate.to_string());
+    }
+    let device = registry::open(&device_args)?;
+    println!("Using Device: {}", device.info());
+    let rate = device.set_sample_rate(Direction::Rx, 0, args.rx_rate)?;
+    device.set_time_now(0, TimeSpec::default())?;
     println!(
         "[{}] Setting device timestamp to 0 (master clock {:.6} MHz)...",
         stamp(start),
-        master_clock_rate / 1e6
+        device.master_clock_rate(0)? / 1e6
     );
-    let tick_rate = session.init_radio(master_clock_rate)?;
     if let Some(freq) = args.freq {
-        session.codec().tune(Direction::Rx, freq)?;
+        device.tune(Direction::Rx, 0, &TuneRequest::new(freq))?;
     }
 
     let mut stream_args = StreamArgs::new();
@@ -166,8 +157,7 @@ pub(crate) fn run(args: &BenchmarkArgs) -> Result<ExitCode> {
     if let Some(frames) = args.num_recv_frames {
         stream_args = stream_args.with_arg("num_recv_frames", frames.to_string());
     }
-    let mut rx = session.rx_stream(&RxOptions::new(args.rx_rate), &stream_args)?;
-    let rate = rx.sample_rate();
+    let mut rx = device.open_rx_stream(&stream_args)?;
     // As benchmark_rate: --rx_spb wins, then --rx_spp, then one packet.
     let spb = args
         .rx_spb
@@ -176,18 +166,16 @@ pub(crate) fn run(args: &BenchmarkArgs) -> Result<ExitCode> {
     if spb == 0 {
         return Err(Error::invalid_arg("--rx-spb must be at least 1"));
     }
-    let time = session.time_core(0)?;
-    time.set_tick_rate(tick_rate)?;
 
     println!(
         "[{}] Testing receive rate {:.6} Msps on 1 channels ({}, {} samples per packet, {} per recv)",
         stamp(start),
         rate / 1e6,
         args.rx_cpu.format().name(),
-        rx.samples_per_packet(),
+        rx.max_num_samps(),
         spb
     );
-    let stats = benchmark_rx(&mut rx, args, rate, spb, &|| time.get_time_now(), start)?;
+    let stats = benchmark_rx(rx.as_mut(), args, rate, spb, &|| device.time_now(0), start)?;
     drop(rx);
     println!("[{}] Benchmark complete.", stamp(start));
     println!();
