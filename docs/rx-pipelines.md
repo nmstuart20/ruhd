@@ -44,8 +44,14 @@ memory, and queued transfers are headroom rather than a required batch.
 Small packets increase host work per sample; use the larger profiles when
 testing throughput near the device's maximum rate.
 
-Once a second, and after the writer finishes, stderr reports current and peak
-**application backlog** in bytes and sample-time milliseconds. It includes
+By default (`--log-level warn`), backlog and latency measurements appear only
+in the final summary after recording stops. Use `--log-level info` (or `-l info`)
+to also show cumulative measurements once a second while recording; `debug`
+and `trace` show them too. `RUST_LOG` overrides the flag and can enable these
+reports specifically with `RUST_LOG=warn,ruhd::rx=info`.
+
+The summary reports current and peak **application backlog** in bytes and
+sample-time milliseconds. It includes
 the partially filled receive block, queued blocks, and a block being written.
 The B2xx receive path updates this counter after each packet fragment is
 copied, including while a receive call is still filling the block.

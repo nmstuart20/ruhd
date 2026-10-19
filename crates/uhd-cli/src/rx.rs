@@ -404,16 +404,19 @@ fn record(
     let block_samples = config.block_samples(rx.host_format());
     let backlog = Arc::new(Backlog::default());
 
-    // Keep reporting even when the receive loop or writer is blocked.
+    // Live measurements follow the existing log filter. When enabled, keep
+    // reporting even when the receive loop or writer is blocked.
     let (monitor_stop, monitor_rx) = mpsc::channel::<()>();
-    let monitor_backlog = Arc::clone(&backlog);
-    let monitor = std::thread::spawn(move || {
-        while matches!(
-            monitor_rx.recv_timeout(Duration::from_secs(1)),
-            Err(mpsc::RecvTimeoutError::Timeout)
-        ) {
-            monitor_backlog.snapshot().report(host_bytes, rate);
-        }
+    let monitor = tracing::enabled!(tracing::Level::INFO).then(|| {
+        let monitor_backlog = Arc::clone(&backlog);
+        std::thread::spawn(move || {
+            while matches!(
+                monitor_rx.recv_timeout(Duration::from_secs(1)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ) {
+                monitor_backlog.snapshot().report(host_bytes, rate);
+            }
+        })
     });
 
     let (full_tx, full_rx) = mpsc::channel::<FilledBlock>();
@@ -456,7 +459,9 @@ fn record(
     drop(full_tx);
     let written = writer.join();
     drop(monitor_stop);
-    let _ = monitor.join();
+    if let Some(monitor) = monitor {
+        let _ = monitor.join();
+    }
     tally.backlog = backlog.snapshot();
     tally.backlog.report(host_bytes, rate);
     eprintln!(

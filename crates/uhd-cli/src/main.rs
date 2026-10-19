@@ -31,6 +31,7 @@ use uhd_transport::usb;
 #[command(name = "ruhd", version, about, long_about = None)]
 struct Cli {
     /// Log level: error, warn, info, debug, trace. `RUST_LOG` overrides this.
+    /// RX live backlog and latency measurements appear at info and above.
     #[arg(long, short, global = true, default_value = "warn")]
     log_level: String,
 
