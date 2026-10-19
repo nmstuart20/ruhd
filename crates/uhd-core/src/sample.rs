@@ -81,7 +81,7 @@ impl SampleFormat {
     #[must_use]
     pub fn bytes_per_sample(self) -> Option<usize> {
         let bits = self.bits_per_sample();
-        (bits % 8 == 0).then_some(bits / 8)
+        bits.is_multiple_of(8).then_some(bits / 8)
     }
 
     /// Whether this format has a host-side Rust type, i.e. whether some

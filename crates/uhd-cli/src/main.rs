@@ -7,6 +7,9 @@ mod rx;
 mod sigmf;
 mod tx;
 
+#[cfg(test)]
+mod test_support;
+
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;

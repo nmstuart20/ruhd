@@ -175,12 +175,26 @@ pub(crate) fn run(args: &BenchmarkArgs) -> Result<ExitCode> {
         rx.max_num_samps(),
         spb
     );
-    let stats = benchmark_rx(rx.as_mut(), args, rate, spb, &|| device.time_now(0), start)?;
+    let mut stats = Stats::default();
+    let result = benchmark_rx(
+        rx.as_mut(),
+        args,
+        rate,
+        spb,
+        &|| device.time_now(0),
+        start,
+        &mut stats,
+    );
     drop(rx);
-    println!("[{}] Benchmark complete.", stamp(start));
+    println!(
+        "[{}] Benchmark {}.",
+        stamp(start),
+        if result.is_ok() { "complete" } else { "failed" }
+    );
     println!();
 
     print_summary(&stats, rate);
+    result?;
 
     let overrun_err = args.overrun_threshold.is_some_and(|t| stats.overruns > t);
     let drop_err = args.drop_threshold.is_some_and(|t| stats.seqrx_errors > t);
@@ -226,8 +240,6 @@ fn print_summary(stats: &Stats, rate: f64) {
         );
     }
     println!();
-    println!("Done!");
-    println!();
 }
 
 /// A small xorshift generator for `--random`: the sizes only need to vary,
@@ -261,11 +273,11 @@ fn benchmark_rx(
     spb: usize,
     time_now: &dyn Fn() -> Result<TimeSpec>,
     start: Instant,
-) -> Result<Stats> {
+    stats: &mut Stats,
+) -> Result<()> {
     let host_bytes = rx.host_format().bits_per_sample() / 8;
     let mut buff = vec![0u8; spb * host_bytes];
     let mut md = RxMetadata::default();
-    let mut stats = Stats::default();
     let mut rng = XorShift::seeded();
 
     let delay = TimeSpec::from_secs(args.rx_delay);
@@ -303,117 +315,214 @@ fn benchmark_rx(
     // at, while the stream is known to be continuous.
     let mut expected: Option<i64> = None;
 
-    loop {
-        let elapsed = Instant::now() >= deadline;
-        if elapsed && !stop_called {
-            rx.issue_stream_cmd(&StreamCmd::stop())?;
-            stop_called = true;
-            stats.samps_before_stop = stats.rx_samps;
-            stats.streamed = started
-                .elapsed()
-                .saturating_sub(Duration::from_secs_f64(args.rx_delay));
-        }
-        if args.random && !stop_called {
-            let (cmd, n) = make_cmd(&mut rng)?;
-            nsamps = n;
-            rx.issue_stream_cmd(&cmd)?;
-        }
-        let n = match rx.recv_raw(&mut [&mut buff[..nsamps * host_bytes]], timeout, &mut md) {
-            Ok(n) => n,
-            Err(e) => {
-                eprintln!("[{}] Caught an IO exception.", stamp(start));
-                eprintln!("{e}");
-                break;
+    let result: Result<()> = (|| {
+        loop {
+            let elapsed = Instant::now() >= deadline;
+            if elapsed && !stop_called {
+                rx.issue_stream_cmd(&StreamCmd::stop())?;
+                stop_called = true;
+                stats.samps_before_stop = stats.rx_samps;
+                stats.streamed = started
+                    .elapsed()
+                    .saturating_sub(Duration::from_secs_f64(args.rx_delay));
             }
-        };
-        stats.rx_samps += n as u64;
-        timeout = burst_pkt_time;
-
-        match md.error {
-            None => {
-                if let (false, Some(time), true) = (args.random, md.time_spec, n > 0) {
-                    let index = time.to_ticks(rate);
-                    if expected.is_some_and(|e| e != index) && !had_an_overflow {
-                        stats.time_jumps += 1;
-                        eprintln!(
-                            "[{}] Timestamp jump: expected sample {}, got {index}.",
-                            stamp(start),
-                            expected.unwrap_or_default()
-                        );
-                    }
-                    expected = Some(index + n as i64);
-                }
-                if had_an_overflow {
-                    had_an_overflow = false;
-                    if let Some(now) = md.time_spec {
-                        let dropped = (now - last_time).to_ticks(rate);
-                        if dropped < 0 {
-                            eprintln!(
-                                "[{}] Timestamp after overrun recovery ahead of error \
-                                 timestamp! Unable to calculate number of dropped \
-                                 samples.(Delta: {dropped} ticks)",
-                                stamp(start)
-                            );
-                        }
-                        stats.dropped_samps += dropped.max(1) as u64;
-                    } else {
-                        stats.dropped_samps += 1;
-                    }
-                }
-                if stop_called && md.end_of_burst {
-                    break;
-                }
-            }
-            Some(RxError::Overflow) => {
-                expected = None;
-                last_time = md.time_spec.unwrap_or(last_time);
-                had_an_overflow = true;
-                if md.out_of_sequence {
-                    stats.seqrx_errors += 1;
-                    eprintln!("[{}] Detected Rx sequence error.", stamp(start));
-                } else {
-                    stats.overruns += 1;
-                }
-            }
-            Some(RxError::LateCommand) => {
-                eprintln!(
-                    "[{}] Receiver error: late command, restart streaming...",
-                    stamp(start)
-                );
-                stats.late_commands += 1;
-                expected = None;
+            if args.random && !stop_called {
                 let (cmd, n) = make_cmd(&mut rng)?;
                 nsamps = n;
-                let cmd = cmd.at(time_now()? + TimeSpec::from_secs(0.05));
                 rx.issue_stream_cmd(&cmd)?;
             }
-            Some(RxError::Timeout) => {
-                if stop_called {
-                    break;
+            let n = rx.recv_raw(&mut [&mut buff[..nsamps * host_bytes]], timeout, &mut md)?;
+            stats.rx_samps += n as u64;
+            timeout = burst_pkt_time;
+
+            match md.error {
+                None => {
+                    if let (false, Some(time), true) = (args.random, md.time_spec, n > 0) {
+                        let index = time.to_ticks(rate);
+                        if expected.is_some_and(|e| e != index) && !had_an_overflow {
+                            stats.time_jumps += 1;
+                            eprintln!(
+                                "[{}] Timestamp jump: expected sample {}, got {index}.",
+                                stamp(start),
+                                expected.unwrap_or_default()
+                            );
+                        }
+                        expected = Some(index + n as i64);
+                    }
+                    if had_an_overflow {
+                        had_an_overflow = false;
+                        if let Some(now) = md.time_spec {
+                            let dropped = (now - last_time).to_ticks(rate);
+                            if dropped < 0 {
+                                eprintln!(
+                                    "[{}] Timestamp after overrun recovery ahead of error \
+                                 timestamp! Unable to calculate number of dropped \
+                                 samples.(Delta: {dropped} ticks)",
+                                    stamp(start)
+                                );
+                            }
+                            stats.dropped_samps += dropped.max(1) as u64;
+                        } else {
+                            stats.dropped_samps += 1;
+                        }
+                    }
+                    if stop_called && md.end_of_burst {
+                        break;
+                    }
                 }
-                eprintln!("[{}] Receiver error: timeout, continuing...", stamp(start));
-                stats.timeouts_rx += 1;
-            }
-            Some(RxError::BadPacket) => {
-                stats.bad_packets += 1;
-                expected = None;
-                eprintln!(
-                    "[{}] Receiver error: bad packet, continuing...",
-                    stamp(start)
-                );
-            }
-            Some(other) => {
-                eprintln!("[{}] Receiver error: {other:?}", stamp(start));
-                eprintln!("[{}] Unexpected error on recv, continuing...", stamp(start));
+                Some(RxError::Overflow) => {
+                    expected = None;
+                    last_time = md.time_spec.unwrap_or(last_time);
+                    had_an_overflow = true;
+                    if md.out_of_sequence {
+                        stats.seqrx_errors += 1;
+                        eprintln!("[{}] Detected Rx sequence error.", stamp(start));
+                    } else {
+                        stats.overruns += 1;
+                    }
+                }
+                Some(RxError::LateCommand) => {
+                    eprintln!(
+                        "[{}] Receiver error: late command, restart streaming...",
+                        stamp(start)
+                    );
+                    stats.late_commands += 1;
+                    expected = None;
+                    let (cmd, n) = make_cmd(&mut rng)?;
+                    nsamps = n;
+                    let cmd = cmd.at(time_now()? + TimeSpec::from_secs(0.05));
+                    rx.issue_stream_cmd(&cmd)?;
+                }
+                Some(RxError::Timeout) => {
+                    if stop_called {
+                        break;
+                    }
+                    eprintln!("[{}] Receiver error: timeout, continuing...", stamp(start));
+                    stats.timeouts_rx += 1;
+                }
+                Some(RxError::BadPacket) => {
+                    stats.bad_packets += 1;
+                    expected = None;
+                    eprintln!(
+                        "[{}] Receiver error: bad packet, continuing...",
+                        stamp(start)
+                    );
+                }
+                Some(other) => {
+                    eprintln!("[{}] Receiver error: {other:?}", stamp(start));
+                    eprintln!("[{}] Unexpected error on recv, continuing...", stamp(start));
+                }
             }
         }
-    }
-    if !stop_called {
+        Ok(())
+    })();
+    let stopped = if !stop_called {
         // The loop ended on an error before the duration was up.
         stats.samps_before_stop = stats.rx_samps;
         stats.streamed = started
             .elapsed()
             .saturating_sub(Duration::from_secs_f64(args.rx_delay));
+        rx.issue_stream_cmd(&StreamCmd::stop())
+    } else {
+        Ok(())
+    };
+    // Keep the original failure if stopping an already broken stream fails too.
+    result?;
+    stopped
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::ScriptedRx;
+    use clap::Parser;
+
+    fn args() -> BenchmarkArgs {
+        let cli = crate::Cli::parse_from(["ruhd", "benchmark", "--rx-rate", "1e6"]);
+        let crate::Command::Benchmark(args) = cli.command else {
+            unreachable!();
+        };
+        args
     }
-    Ok(stats)
+
+    #[test]
+    fn receive_failure_preserves_stats_and_stops_the_stream() {
+        let mut rx = ScriptedRx::new([
+            Ok((vec![1; 8], RxMetadata::default())),
+            Err(Error::transport("device disconnected")),
+        ]);
+        let mut stats = Stats::default();
+        let result = benchmark_rx(
+            &mut rx,
+            &args(),
+            1e6,
+            4,
+            &|| Ok(TimeSpec::ZERO),
+            Instant::now(),
+            &mut stats,
+        );
+
+        assert!(
+            matches!(result, Err(Error::Transport(ref message)) if message == "device disconnected")
+        );
+        assert_eq!(stats.rx_samps, 2);
+        assert_eq!(stats.samps_before_stop, 2);
+        assert!(stats.streamed > Duration::ZERO);
+        assert_eq!(
+            rx.commands,
+            [StreamCmd::start_continuous(), StreamCmd::stop()]
+        );
+    }
+
+    #[test]
+    fn cleanup_failure_does_not_hide_the_receive_failure() {
+        let mut rx = ScriptedRx::new([Err(Error::transport("receive failed"))]);
+        rx.stop_error = Some(Error::device("stop failed"));
+        let result = benchmark_rx(
+            &mut rx,
+            &args(),
+            1e6,
+            4,
+            &|| Ok(TimeSpec::ZERO),
+            Instant::now(),
+            &mut Stats::default(),
+        );
+
+        assert!(
+            matches!(result, Err(Error::Transport(ref message)) if message == "receive failed")
+        );
+        assert_eq!(rx.commands.last(), Some(&StreamCmd::stop()));
+    }
+
+    #[test]
+    fn normal_stop_drains_the_stream_successfully() {
+        let mut args = args();
+        // Rounds to a zero duration, so the stop command precedes the receive.
+        args.duration = f64::MIN_POSITIVE;
+        let mut rx = ScriptedRx::new([Ok((
+            vec![1; 8],
+            RxMetadata {
+                end_of_burst: true,
+                ..Default::default()
+            },
+        ))]);
+        let mut stats = Stats::default();
+        benchmark_rx(
+            &mut rx,
+            &args,
+            1e6,
+            4,
+            &|| Ok(TimeSpec::ZERO),
+            Instant::now(),
+            &mut stats,
+        )
+        .unwrap();
+
+        assert_eq!(stats.rx_samps, 2);
+        assert_eq!(stats.samps_before_stop, 0);
+        assert_eq!(
+            rx.commands,
+            [StreamCmd::start_continuous(), StreamCmd::stop()]
+        );
+    }
 }

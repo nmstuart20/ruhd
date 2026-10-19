@@ -116,7 +116,7 @@ fn interp_word(interp: u32) -> (u32, u32) {
     let mut word = 0;
     // TX enables HB0 in bit 8; RX enables its first half-band in bit 9.
     for bit in [8, 9] {
-        if cic % 2 == 0 {
+        if cic.is_multiple_of(2) {
             word |= 1 << bit;
             cic /= 2;
         }

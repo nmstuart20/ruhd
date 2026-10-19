@@ -251,7 +251,7 @@ impl IfHeader {
 /// `bytes` may extend past the end of the packet, as a USB transfer buffer
 /// does; the packet's own length field decides where it ends.
 pub fn parse_header(bytes: &[u8], link_type: LinkType, endian: Endian) -> Result<IfHeader, Error> {
-    if bytes.len() < 4 || bytes.len() % 4 != 0 {
+    if bytes.len() < 4 || !bytes.len().is_multiple_of(4) {
         return Err(Error("packet is not whole 32-bit words"));
     }
     let total_words = bytes.len() / 4;

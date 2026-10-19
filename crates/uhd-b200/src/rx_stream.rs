@@ -246,9 +246,9 @@ pub fn coerce_recv_frame_size(requested: usize, max_transfer: usize) -> usize {
         return MAX_RECV_FRAME_SIZE;
     }
     let mut size = requested;
-    if size % max_transfer == 0 || size % 8 != 0 {
+    if size.is_multiple_of(max_transfer) || !size.is_multiple_of(8) {
         size += 8 - (size % 8);
-        if size % max_transfer == 0 {
+        if size.is_multiple_of(max_transfer) {
             size = ((size - 16) / 24) * 24 + 16;
         }
     }

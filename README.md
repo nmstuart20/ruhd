@@ -6,7 +6,7 @@ validation is pending. Licensed GPL-3.0-or-later.
 
 ## Run
 
-Requires Rust 1.85+ and optionally [just](https://github.com/casey/just).
+Requires Rust 1.88+ and optionally [just](https://github.com/casey/just).
 
 ```sh
 cargo build --workspace

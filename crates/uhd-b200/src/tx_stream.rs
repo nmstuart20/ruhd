@@ -328,7 +328,7 @@ impl RawTxStreamer for B200TxStreamer {
 
     fn send_raw(&mut self, buffs: &[&[u8]], timeout: Duration, md: &TxMetadata) -> Result<usize> {
         let host_bytes = self.format.bytes_per_sample().unwrap();
-        if buffs.len() != 1 || buffs[0].len() % host_bytes != 0 {
+        if buffs.len() != 1 || !buffs[0].len().is_multiple_of(host_bytes) {
             return Err(Error::Buffer(
                 "TX needs one buffer containing whole complex samples".into(),
             ));

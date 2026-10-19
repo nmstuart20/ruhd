@@ -121,7 +121,7 @@ fn table(num_taps: usize, factor: i32, direction: Direction) -> Result<&'static 
 /// the bus reports.
 pub fn program(regs: &Registers, direction: Direction, chain: Chain, coeffs: &[i16]) -> Result<()> {
     let num_taps = coeffs.len();
-    if num_taps == 0 || num_taps > MAX_TAPS || num_taps % 16 != 0 {
+    if num_taps == 0 || num_taps > MAX_TAPS || !num_taps.is_multiple_of(16) {
         return Err(Error::invalid_arg(format!(
             "ad936x fir tap count {num_taps}; it must be a multiple of 16 up to {MAX_TAPS}"
         )));

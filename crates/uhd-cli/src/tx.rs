@@ -194,7 +194,7 @@ pub(crate) fn run(args: &TxArgs) -> Result<()> {
                 sent += count as u64;
                 offset += count * sample_bytes;
                 packets += 1;
-                if packets % 128 == 0 {
+                if packets.is_multiple_of(128) {
                     while let Some(md) = tx.recv_async_msg(Duration::ZERO)? {
                         report(md.event)?;
                     }

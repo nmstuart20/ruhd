@@ -464,14 +464,20 @@ fn pump(
     let mut block = empty.recv().map_err(|_| closed())?;
     let mut filled = 0usize;
 
-    while remaining(tally) > 0 && !stop.load(Ordering::SeqCst) {
+    let result = loop {
+        if remaining(tally) == 0 || stop.load(Ordering::SeqCst) {
+            break Ok(());
+        }
         let room =
             (block_samples - filled).min(usize::try_from(remaining(tally)).unwrap_or(usize::MAX));
-        let n = rx.recv_raw(
+        let n = match rx.recv_raw(
             &mut [&mut block[filled * host_bytes..(filled + room) * host_bytes]],
             timeout,
             &mut md,
-        )?;
+        ) {
+            Ok(n) => n,
+            Err(e) => break Err(e),
+        };
         let kind = match md.error {
             None => None,
             Some(RxError::Overflow) if md.out_of_sequence => {
@@ -488,9 +494,9 @@ fn pump(
                 tally.bad_packets += 1;
                 Some(EventKind::BadPacket)
             }
-            Some(RxError::Timeout) => return Err(Error::Timeout(timeout)),
+            Some(RxError::Timeout) => break Err(Error::Timeout(timeout)),
             Some(other) => {
-                return Err(Error::Device(format!("receive stream error: {other:?}")));
+                break Err(Error::Device(format!("receive stream error: {other:?}")));
             }
         };
         if let Some(kind) = kind {
@@ -518,10 +524,142 @@ fn pump(
             filled = 0;
             block = empty.recv().map_err(|_| closed())?;
         }
-    }
+    };
+    // Keep samples from earlier receives even when the next receive fails.
+    // The writer drains this block before record() returns the stream error.
     if filled > 0 {
         full.send((block, filled * host_bytes))
             .map_err(|_| closed())?;
     }
-    Ok(())
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::ScriptedRx;
+    use std::sync::Mutex;
+
+    #[derive(Clone, Default)]
+    struct Capture {
+        bytes: Arc<Mutex<Vec<u8>>>,
+        flushed: Arc<AtomicBool>,
+    }
+
+    impl Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.bytes.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushed.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn receive_errors_flush_the_partial_block_and_keep_annotation_positions() {
+        let failures = [
+            (
+                Err(Error::transport("device disconnected")),
+                Error::transport("device disconnected"),
+            ),
+            (
+                Ok((
+                    Vec::new(),
+                    RxMetadata {
+                        error: Some(RxError::Timeout),
+                        ..Default::default()
+                    },
+                )),
+                Error::Timeout(RUNNING_TIMEOUT),
+            ),
+            (
+                Ok((
+                    Vec::new(),
+                    RxMetadata {
+                        error: Some(RxError::LateCommand),
+                        ..Default::default()
+                    },
+                )),
+                Error::device("receive stream error: LateCommand"),
+            ),
+        ];
+        for (failure, expected_error) in failures {
+            let first_time = uhd_core::TimeSpec::from_secs(1.0);
+            let expected = [vec![11; BLOCK_BYTES], vec![22; 8]].concat();
+            let mut rx = ScriptedRx::new([
+                Ok((
+                    expected[..BLOCK_BYTES].to_vec(),
+                    RxMetadata {
+                        time_spec: Some(first_time),
+                        ..Default::default()
+                    },
+                )),
+                Ok((
+                    expected[BLOCK_BYTES..].to_vec(),
+                    RxMetadata {
+                        error: Some(RxError::Overflow),
+                        ..Default::default()
+                    },
+                )),
+                failure,
+            ]);
+            let capture = Capture::default();
+            let mut tally = Tally::default();
+            let result = record(
+                &mut rx,
+                Box::new(capture.clone()),
+                None,
+                &AtomicBool::new(false),
+                &mut tally,
+            );
+
+            assert_eq!(result.unwrap_err().to_string(), expected_error.to_string());
+            assert_eq!(*capture.bytes.lock().unwrap(), expected);
+            assert!(capture.flushed.load(Ordering::SeqCst));
+            assert_eq!(tally.samples as usize * 4, expected.len());
+            assert_eq!(tally.first_device_time, Some(first_time.as_secs_f64()));
+            assert!(tally.started.is_some());
+            assert_eq!(tally.overflows, 1);
+            assert_eq!(
+                tally.events,
+                [Event {
+                    sample: (BLOCK_BYTES / 4) as u64,
+                    kind: EventKind::Overflow,
+                    device_time: None,
+                }]
+            );
+            assert_eq!(
+                rx.commands,
+                [StreamCmd::start_continuous(), StreamCmd::stop()]
+            );
+        }
+    }
+
+    #[test]
+    fn finite_recording_flushes_the_partial_block() {
+        let expected = vec![42; 12];
+        let mut rx = ScriptedRx::new([Ok((expected.clone(), RxMetadata::default()))]);
+        let capture = Capture::default();
+        let mut tally = Tally::default();
+        record(
+            &mut rx,
+            Box::new(capture.clone()),
+            Some(3),
+            &AtomicBool::new(false),
+            &mut tally,
+        )
+        .unwrap();
+
+        assert_eq!(*capture.bytes.lock().unwrap(), expected);
+        assert!(capture.flushed.load(Ordering::SeqCst));
+        assert_eq!(tally.samples, 3);
+        assert!(tally.events.is_empty());
+        assert_eq!(
+            rx.commands,
+            [StreamCmd::start_continuous(), StreamCmd::stop()]
+        );
+    }
 }

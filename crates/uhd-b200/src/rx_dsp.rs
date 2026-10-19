@@ -268,11 +268,11 @@ fn decim_word(decim: u32) -> (u32, u32) {
     let mut cic = decim;
     let mut hb0 = 0;
     let mut hb1 = 0;
-    if cic % 2 == 0 {
+    if cic.is_multiple_of(2) {
         hb0 = 1;
         cic /= 2;
     }
-    if cic % 2 == 0 {
+    if cic.is_multiple_of(2) {
         hb1 = 1;
         cic /= 2;
     }
