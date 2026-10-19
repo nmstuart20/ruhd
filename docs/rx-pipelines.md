@@ -17,13 +17,13 @@ just rx --freq 98.1e6 --rate 2.4e6 --gain 40 --type fc32 --file - \
   | csdr fir_decimate_cc 10 0.05 HAMMING \
   | csdr fmdemod_quadri_cf \
   | csdr fractional_decimator_ff 5 \
-  | csdr deemphasis_wfm_ff 48000 50e-6 \
+  | csdr deemphasis_wfm_ff 48000 75e-6 \
   | csdr convert_f_s16 \
   | aplay -f S16_LE -r 48000 -c 1
 ```
 
-The example uses 50 microseconds of FM de-emphasis, as used in Europe; use
-`75e-6` instead of `50e-6` for North America.
+The example uses 75 microseconds of FM de-emphasis, as used in Europe; use
+`50e-6` instead of `75e-6` for Europe.
 
 Save a capture while feeding a decoder that accepts raw `sc16` on stdin
 (replace `my-decoder` with your tool):
