@@ -376,7 +376,10 @@ impl B200Session {
     /// and tuning, gain and bandwidth are the codec's business, not the
     /// stream's.
     ///
-    /// `args.args` takes UHD's `spp`, `recv_frame_size` and `num_recv_frames`.
+    /// `args.args` takes UHD's `spp`, `recv_frame_size` and `num_recv_frames`,
+    /// plus `recv_buff_size` (host buffering in bytes) and the driver thread's
+    /// `driver_rt_priority`, `driver_cpu` and `driver_mlock`; see
+    /// [`crate::rx_stream`].
     ///
     /// # Errors
     ///
@@ -651,10 +654,7 @@ pub fn checkup(probe: &UsbProbe, catalog: &dyn ImageCatalog) -> Checkup {
     };
 
     if probe.needs_firmware() {
-        checkup.trouble = Some(format!(
-            "no firmware is running ({})",
-            probe.state
-        ));
+        checkup.trouble = Some(format!("no firmware is running ({})", probe.state));
         return checkup;
     }
 

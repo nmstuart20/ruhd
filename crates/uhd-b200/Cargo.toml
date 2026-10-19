@@ -29,6 +29,10 @@ uhd-transport.workspace = true
 # fetching images is `ruhd images sync`'s job, not a driver's.
 uhd-images = { workspace = true, default-features = false }
 
+# The rx driver thread's optional SCHED_FIFO, CPU pinning and mlockall.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+
 [[example]]
 name = "scratch_gate"
 

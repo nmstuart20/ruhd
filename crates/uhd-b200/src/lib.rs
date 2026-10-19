@@ -75,6 +75,7 @@ pub mod factory;
 pub mod misc;
 pub mod policy;
 pub mod radio_ctrl;
+mod rx_driver;
 pub mod rx_dsp;
 pub mod rx_framer;
 pub mod rx_stream;

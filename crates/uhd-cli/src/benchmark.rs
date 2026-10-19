@@ -19,6 +19,7 @@ use uhd_core::{DeviceArgs, Direction, Error, Result, TimeSpec, TuneRequest, regi
 
 use crate::benchmark_metrics::{ProcessUsage, RecvTiming};
 use crate::rx::FileType;
+use crate::rx_driver_args::DriverArgs;
 use crate::rx_stats::LossStats;
 
 #[derive(Debug, Args)]
@@ -78,6 +79,8 @@ pub(crate) struct BenchmarkArgs {
     /// USB transfers kept queued with the kernel.
     #[arg(long)]
     num_recv_frames: Option<usize>,
+    #[command(flatten)]
+    driver: DriverArgs,
     /// Only the device with this serial.
     #[arg(long)]
     serial: Option<String>,
@@ -171,6 +174,7 @@ pub(crate) fn run(args: &BenchmarkArgs) -> Result<ExitCode> {
     if let Some(frames) = args.num_recv_frames {
         stream_args = stream_args.with_arg("num_recv_frames", frames.to_string());
     }
+    let stream_args = args.driver.apply(stream_args);
     let mut rx = device.open_rx_stream(&stream_args)?;
     let rx_spp = rx.max_num_samps();
     // As benchmark_rate: --rx_spb wins, then --rx_spp, then one packet.
@@ -310,6 +314,7 @@ impl BenchmarkArgs {
                 "samples_per_packet": config.spp,
                 "samples_per_recv": config.spb,
                 "num_recv_frames": self.num_recv_frames.unwrap_or(uhd_b200::rx_stream::DEFAULT_NUM_RECV_FRAMES),
+                "driver": self.driver.report(),
                 "duration_seconds": self.duration,
                 "start_delay_seconds": self.rx_delay,
                 "random_bursts": self.random,

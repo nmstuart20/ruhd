@@ -24,6 +24,7 @@ use uhd_core::{
 };
 
 use crate::rx_backlog::{Backlog, Snapshot};
+use crate::rx_driver_args::DriverArgs;
 use crate::rx_latency::BlockTiming;
 use crate::rx_profile::{RxConfig, RxProfile};
 use crate::rx_stats::LossStats;
@@ -114,6 +115,8 @@ pub(crate) struct RxArgs {
     /// USB transfers kept queued with the kernel; overrides the profile.
     #[arg(long)]
     num_recv_frames: Option<usize>,
+    #[command(flatten)]
+    driver: DriverArgs,
     /// Seconds to wait after tuning before streaming, for the LO and the
     /// analog front end to settle.
     #[arg(long, default_value_t = 0.5)]
@@ -266,7 +269,9 @@ pub(crate) fn run(args: &RxArgs) -> Result<()> {
     let antenna = device.antenna(Direction::Rx, 0)?;
     eprintln!("Using Device: {info}");
 
-    let stream_args = config.stream_args(args.file_type.format());
+    let stream_args = args
+        .driver
+        .apply(config.stream_args(args.file_type.format()));
     let mut rx = device.open_rx_stream(&stream_args)?;
 
     eprintln!("  master clock: {:.6} MHz", tick_rate / 1e6);

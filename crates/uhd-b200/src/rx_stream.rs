@@ -22,8 +22,21 @@
 //! transfer cannot keep up with that: the host would be idle between each
 //! completion and the next submission. So [`B200RxStreamer`] keeps
 //! `num_recv_frames` transfers queued with the kernel at all times — 128 by
-//! default, eight times UHD's 16; see [`DEFAULT_NUM_RECV_FRAMES`]. A packet's buffer goes back in the queue as soon as its
-//! last sample has been copied out.
+//! default, eight times UHD's 16; see [`DEFAULT_NUM_RECV_FRAMES`].
+//!
+//! Unlike UHD, the transfers are not reaped by the thread calling `recv`. A
+//! driver thread owns the endpoint, resubmits each transfer the moment it
+//! completes, and passes the filled buffer on through a bounded queue, so a
+//! caller that stalls does not stall the USB queue. Behind the kernel queue
+//! sits `recv_buff_size` bytes of host buffering, [`DEFAULT_RECV_BUFF_SIZE`]
+//! by default; the device only overflows once the caller is that far behind.
+//! A packet's buffer goes back to the pool as soon as its last sample has
+//! been copied out.
+//!
+//! The driver thread can optionally run under `SCHED_FIFO`
+//! (`driver_rt_priority=1..99`), pinned to a core (`driver_cpu=N`), with the
+//! process's memory locked (`driver_mlock=1`). Each is a stream argument and
+//! each only warns if the OS refuses it.
 //!
 //! # A difference from libusb
 //!
@@ -48,6 +61,7 @@ use uhd_core::{Error, Result, SampleFormat, TimeSpec};
 use uhd_transport::RegisterIface;
 
 use crate::atr::{GpioAtr, Side};
+use crate::rx_driver::{self, DriverConfig, Recv, RxDriver};
 use crate::rx_dsp::RxDsp;
 use crate::rx_framer::RxFramer;
 use crate::session::B200Session;
@@ -77,6 +91,13 @@ pub const MAX_RECV_FRAME_SIZE: usize = 16360;
 /// overflows. On a B205mini over USB 3, 16 overflowed repeatedly at 61.44 MS/s
 /// where 128 (1 MiB in all) ran clean or nearly so, so this queues 128.
 pub const DEFAULT_NUM_RECV_FRAMES: usize = 128;
+/// Bytes of host buffering behind the kernel queue by default: about a
+/// quarter of a second of `sc16` at 30.72 MS/s.
+///
+/// Filled transfers wait here when the caller falls behind, instead of the
+/// device overflowing. It costs memory, not latency: a caller that keeps up
+/// finds it empty.
+pub const DEFAULT_RECV_BUFF_SIZE: usize = 32 << 20;
 /// The framer's largest packet at full rate, in samples.
 pub const MAX_SPP: usize = 4092;
 
@@ -254,7 +275,10 @@ enum Next {
 /// cancels the queued transfers and returns the front end to its idle state.
 #[derive(Debug)]
 pub struct B200RxStreamer {
-    ep: nusb::Endpoint<Bulk, In>,
+    driver: RxDriver,
+    /// [`RxDriver::starved`] when last reported.
+    starved_seen: u64,
+    host_buffer_bytes: usize,
     framer: RxFramer,
     dsp: RxDsp,
     atr: GpioAtr,
@@ -309,6 +333,44 @@ struct Shape {
     frame_size: usize,
     num_frames: usize,
     spp: usize,
+    recv_buff_size: usize,
+    driver: DriverConfig,
+}
+
+/// `key=1`/`true` or `key=0`/`false`.
+fn parse_flag(args: &StreamArgs, key: &str) -> Result<bool> {
+    match args.args.get(key).map(str::to_ascii_lowercase).as_deref() {
+        None | Some("0" | "false" | "no" | "off") => Ok(false),
+        Some("" | "1" | "true" | "yes" | "on") => Ok(true),
+        Some(other) => Err(Error::invalid_arg(format!(
+            "{key}={other}: expected 1 or 0"
+        ))),
+    }
+}
+
+fn driver_config(args: &StreamArgs) -> Result<DriverConfig> {
+    let rt_priority = args.args.get_parsed::<i32>("driver_rt_priority")?;
+    if let Some(priority) = rt_priority
+        && !(1..=99).contains(&priority)
+    {
+        return Err(Error::invalid_arg(format!(
+            "driver_rt_priority={priority}: SCHED_FIFO priorities run from 1 to 99"
+        )));
+    }
+    let cpu = args.args.get_parsed::<usize>("driver_cpu")?;
+    if let Some(cpu) = cpu
+        && cpu > rx_driver::MAX_CPU
+    {
+        return Err(Error::invalid_arg(format!(
+            "driver_cpu={cpu}: at most {}",
+            rx_driver::MAX_CPU
+        )));
+    }
+    Ok(DriverConfig {
+        rt_priority,
+        cpu,
+        mlock: parse_flag(args, "driver_mlock")?,
+    })
 }
 
 fn shape(args: &StreamArgs, max_transfer: usize) -> Result<Shape> {
@@ -371,12 +433,25 @@ fn shape(args: &StreamArgs, max_transfer: usize) -> Result<Shape> {
     }
     .min(MAX_SPP);
 
+    // A float, as UHD's buffer sizes usually are written (`32e6`).
+    let recv_buff_size = match args.args.get_parsed::<f64>("recv_buff_size")? {
+        Some(bytes) if bytes.is_finite() && bytes >= 0.0 => bytes as usize,
+        Some(bytes) => {
+            return Err(Error::invalid_arg(format!(
+                "recv_buff_size={bytes}: must be zero or more bytes"
+            )));
+        }
+        None => DEFAULT_RECV_BUFF_SIZE,
+    };
+
     Ok(Shape {
         radio,
         host_format,
         frame_size,
         num_frames,
         spp,
+        recv_buff_size,
+        driver: driver_config(args)?,
     })
 }
 
@@ -463,8 +538,13 @@ pub(crate) fn open(
     atr.set_b2xx_states(side, true, false, options.antenna == RxAntenna::Rx2)?;
 
     let transfer_len = shape.frame_size.div_ceil(max_transfer) * max_transfer;
+    let host_frames = shape.recv_buff_size / transfer_len;
+    let pool = buffer_pool(&ep, transfer_len, shape.num_frames, host_frames);
+    let driver = RxDriver::start(ep, shape.num_frames, pool, shape.driver)?;
     let mut streamer = B200RxStreamer {
-        ep,
+        driver,
+        starved_seen: 0,
+        host_buffer_bytes: host_frames * transfer_len,
         framer,
         dsp,
         atr,
@@ -483,11 +563,6 @@ pub(crate) fn open(
         queued_error: None,
     };
     streamer.scale = streamer.dsp.scaling_adjustment();
-    for _ in 0..shape.num_frames {
-        let mut buf = streamer.ep.allocate(transfer_len);
-        buf.set_requested_len(transfer_len);
-        streamer.ep.submit(buf);
-    }
     let stale = streamer.flush();
     debug!(
         radio = shape.radio,
@@ -498,11 +573,43 @@ pub(crate) fn open(
         spp = shape.spp,
         transfer_len,
         num_frames = shape.num_frames,
+        host_frames,
+        host_buffer_ms = (host_frames * shape.spp) as f64 / rate * 1e3,
+        driver = ?shape.driver,
         stale,
         antenna = %options.antenna,
         "b2xx rx stream open"
     );
     Ok(streamer)
+}
+
+/// The buffers the driver thread circulates: `kernel` for the kernel queue,
+/// then `host` spares.
+///
+/// The kernel's share is zero-copy where usbfs allows it. The spares are
+/// ordinary heap memory, since usbfs caps zero-copy memory per process
+/// (`usbfs_memory_mb`, 16 MiB by default) well below the host buffer's size,
+/// and they are written once now so the driver thread never takes a page
+/// fault on first use.
+fn buffer_pool(
+    ep: &nusb::Endpoint<Bulk, In>,
+    transfer_len: usize,
+    kernel: usize,
+    host: usize,
+) -> Vec<Buffer> {
+    let mut pool = Vec::with_capacity(kernel + host);
+    pool.extend((0..kernel).map(|_| {
+        let mut buf = ep.allocate(transfer_len);
+        buf.set_requested_len(transfer_len);
+        buf
+    }));
+    pool.extend((0..host).map(|_| {
+        let mut buf = Buffer::new(transfer_len);
+        buf.extend_fill(buf.capacity(), 0);
+        buf.clear();
+        buf
+    }));
+    pool
 }
 
 impl B200RxStreamer {
@@ -536,22 +643,43 @@ impl B200RxStreamer {
         self.spp
     }
 
-    /// Discards everything the endpoint has delivered or will deliver within
-    /// the flush timeout. Returns how many packets went.
+    /// Host buffering behind the kernel queue, in bytes.
+    #[must_use]
+    pub fn host_buffer_bytes(&self) -> usize {
+        self.host_buffer_bytes
+    }
+
+    /// Discards everything the driver thread has delivered or will deliver
+    /// within the flush timeout. Returns how many packets went.
     fn flush(&mut self) -> usize {
         if let Some(packet) = self.current.take() {
-            self.ep.submit(packet.buf);
+            self.driver.release(packet.buf);
         }
         let mut count = 0;
         while count < FLUSH_LIMIT {
-            let Some(completion) = self.ep.wait_next_complete(FLUSH_TIMEOUT) else {
+            let Recv::Filled(Ok(buf) | Err((_, buf))) = self.driver.recv(FLUSH_TIMEOUT) else {
                 break;
             };
-            self.ep.submit(completion.buffer);
+            self.driver.release(buf);
             count += 1;
         }
         self.expected_seq = None;
         count
+    }
+
+    /// Warns once for each new episode of the host buffer filling up, which
+    /// the device overflow that follows does not explain on its own.
+    fn check_starved(&mut self) {
+        let starved = self.driver.starved();
+        if starved > self.starved_seen {
+            warn!(
+                episodes = starved - self.starved_seen,
+                host_buffer_bytes = self.host_buffer_bytes,
+                "the b2xx rx host buffer filled up: recv is not keeping up with the \
+                 sample rate; raise recv_buff_size or receive faster"
+            );
+            self.starved_seen = starved;
+        }
     }
 
     /// `handle_overflow` for a single-channel stream: discard what is
@@ -570,31 +698,39 @@ impl B200RxStreamer {
     fn next_packet(&mut self, deadline: Instant) -> Result<Next> {
         loop {
             let wait = deadline.saturating_duration_since(Instant::now());
-            let Some(completion) = self.ep.wait_next_complete(wait) else {
-                return Ok(Next::Timeout);
+            let buf = match self.driver.recv(wait) {
+                Recv::Filled(Ok(buf)) => buf,
+                Recv::Filled(Err((e, buf))) => {
+                    // Return the buffer so the pool stays whole if the caller
+                    // decides to carry on.
+                    self.driver.release(buf);
+                    self.continuity.note(RxLossCause::Transport);
+                    return Err(Error::Transport(format!(
+                        "b2xx rx data transfer failed: {e}"
+                    )));
+                }
+                Recv::Timeout => return Ok(Next::Timeout),
+                Recv::Stopped => {
+                    self.continuity.note(RxLossCause::Transport);
+                    return Err(Error::Transport(
+                        "the b2xx rx driver thread has stopped after repeated transfer \
+                         failures or a disconnect"
+                            .into(),
+                    ));
+                }
             };
-            if let Err(e) = completion.status {
-                // Put the buffer back so the queue stays its full depth if the
-                // caller decides to carry on.
-                self.ep.submit(completion.buffer);
-                self.continuity.note(RxLossCause::Transport);
-                return Err(Error::Transport(format!(
-                    "b2xx rx data transfer failed: {e}"
-                )));
-            }
-            let buf = completion.buffer;
             let header = match chdr::parse_header(&buf, LinkType::Chdr, Endian::Little) {
                 Ok(header) => header,
                 Err(e) => {
                     warn!(%e, len = buf.len(), "discarding an unparseable b2xx rx packet");
-                    self.ep.submit(buf);
+                    self.driver.release(buf);
                     return Ok(Next::Bad);
                 }
             };
             let info = &header.info;
             if info.sid != Some(self.sid) {
                 trace!(sid = ?info.sid, want = self.sid, "skipping a packet for another stream");
-                self.ep.submit(buf);
+                self.driver.release(buf);
                 continue;
             }
             let payload = header.payload_range();
@@ -602,7 +738,7 @@ impl B200RxStreamer {
             if info.packet_type != PacketType::Data {
                 let code = context_code(&buf[payload]);
                 let tsf = info.tsf;
-                self.ep.submit(buf);
+                self.driver.release(buf);
                 match inline_error(code) {
                     Some(error) => return Ok(Next::Inline { error, tsf }),
                     None => {
@@ -622,7 +758,7 @@ impl B200RxStreamer {
                     bytes = payload.len(),
                     "discarding a b2xx rx packet that is not whole sc16 samples"
                 );
-                self.ep.submit(buf);
+                self.driver.release(buf);
                 return Ok(Next::Bad);
             }
             self.expected_seq = Some((count + 1) & 0xfff);
@@ -726,6 +862,7 @@ impl B200RxStreamer {
                 buffs.len()
             )));
         };
+        self.check_starved();
         if let Some(event) = self.queued.take() {
             *md = event;
             return Ok(0);
@@ -837,7 +974,7 @@ impl B200RxStreamer {
                     if eob {
                         self.expected_seq = None;
                     }
-                    self.ep.submit(packet.buf);
+                    self.driver.release(packet.buf);
                 }
                 if eob {
                     md.end_of_burst = true;
@@ -858,13 +995,8 @@ impl Drop for B200RxStreamer {
         {
             debug!(%e, "could not stop the b2xx rx framer while closing the stream");
         }
-        self.ep.cancel_all();
-        while self.ep.pending() > 0 {
-            if self.ep.wait_next_complete(Duration::from_secs(1)).is_none() {
-                warn!("b2xx rx transfers did not return after cancellation");
-                break;
-            }
-        }
+        // Cancels and reaps every queued transfer before the front end idles.
+        self.driver.shutdown();
         if let Err(e) =
             self.atr
                 .set_b2xx_states(self.side, false, false, self.antenna == RxAntenna::Rx2)
@@ -1094,6 +1226,49 @@ mod tests {
             .with_arg("recv_frame_size", "16360")
             .with_arg("spp", "100000");
         assert_eq!(shape(&args, 1024).unwrap().spp, 4086);
+    }
+
+    #[test]
+    fn host_buffering_and_driver_options_parse() {
+        let shape0 = shape(&StreamArgs::new(), 1024).unwrap();
+        assert_eq!(shape0.recv_buff_size, DEFAULT_RECV_BUFF_SIZE);
+        assert_eq!(shape0.driver, DriverConfig::default());
+
+        let args = StreamArgs::new()
+            .with_arg("recv_buff_size", "64e6")
+            .with_arg("driver_rt_priority", "80")
+            .with_arg("driver_cpu", "3")
+            .with_arg("driver_mlock", "1");
+        let shape1 = shape(&args, 1024).unwrap();
+        assert_eq!(shape1.recv_buff_size, 64_000_000);
+        assert_eq!(
+            shape1.driver,
+            DriverConfig {
+                rt_priority: Some(80),
+                cpu: Some(3),
+                mlock: true,
+            }
+        );
+        assert_eq!(
+            shape(&StreamArgs::new().with_arg("recv_buff_size", "0"), 1024)
+                .unwrap()
+                .recv_buff_size,
+            0
+        );
+
+        for (key, value) in [
+            ("recv_buff_size", "-1"),
+            ("driver_rt_priority", "0"),
+            ("driver_rt_priority", "100"),
+            ("driver_cpu", "4096"),
+            ("driver_mlock", "maybe"),
+        ] {
+            let args = StreamArgs::new().with_arg(key, value);
+            assert!(
+                matches!(shape(&args, 1024), Err(Error::InvalidArg(_))),
+                "{key}={value} should be refused"
+            );
+        }
     }
 
     #[test]

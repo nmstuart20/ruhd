@@ -14,6 +14,34 @@ and sequence-error notifications. A sequence anomaly can have zero missing
 samples according to the timestamps; use those thresholds too if any such
 notification should fail the run. Thresholds fail when exceeded, not when met.
 
+## The receive driver thread
+
+USB transfers are reaped and resubmitted by a dedicated driver thread, not by
+the thread calling `recv`. Filled transfers wait in `recv_buff_size` bytes of
+host buffering (`--recv-buff-size`, 32 MiB by default) behind the
+`num_recv_frames` kernel queue, so a slow `recv` caller overflows the device
+only once it is that far behind. The warning "rx host buffer filled up" means
+the caller fell behind by the whole host buffer.
+
+The host buffer does not help when the reaping path itself is descheduled:
+nusb's `nusb-events` thread reaps each URB and wakes the driver thread, and
+if either is held off for longer than the kernel queue lasts (128 transfers
+of 8 KiB is about 8.5 ms at 30.72 MS/s `sc16`), the device overflows. On a
+loaded desktop those stalls reach tens of milliseconds. Either give both
+threads real-time priority:
+
+```sh
+sudo setcap cap_sys_nice,cap_ipc_lock+ep target/release/ruhd
+target/release/ruhd benchmark --rx-rate 30.72e6 --duration 60 \
+  --driver-priority 80 --driver-cpu 3 --driver-mlock --loss-threshold 0
+```
+
+or deepen the kernel queue (`--num-recv-frames 1024` is 8 MiB, about 68 ms;
+usbfs limits a process to `usbfs_memory_mb`, 16 MiB by default).
+`--driver-priority` and `--driver-cpu` apply to both threads. Each option
+only warns if the OS refuses it. Reports record them under
+`configuration.driver`.
+
 ## What counts as loss
 
 The B2xx streamer checks both the packet sequence counter and integer device

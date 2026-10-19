@@ -992,6 +992,7 @@ version = "0.1.0"
 dependencies = [
  "ad936x",
  "chdr",
+ "libc",
  "nusb",
  "tracing",
  "uhd-core",
