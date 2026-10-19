@@ -68,7 +68,9 @@ pub mod tune;
 pub use args::DeviceArgs;
 pub use device::{Device, DeviceExt, DeviceInfo, Direction, SensorData, SensorScope, SensorValue};
 pub use error::{Error, Result};
-pub use metadata::{AsyncEvent, AsyncMetadata, RxError, RxMetadata, TxMetadata};
+pub use metadata::{
+    AsyncEvent, AsyncMetadata, RxError, RxLoss, RxLossCause, RxMetadata, TxMetadata,
+};
 pub use range::{MetaRange, Range};
 pub use registry::{DeviceFactory, Registry};
 pub use sample::{Sample, SampleFormat};

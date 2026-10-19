@@ -1006,6 +1006,7 @@ dependencies = [
  "ad936x",
  "clap",
  "ctrlc",
+ "libc",
  "serde_json",
  "sha2",
  "tracing",

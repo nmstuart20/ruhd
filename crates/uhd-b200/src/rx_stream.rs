@@ -42,7 +42,7 @@ use chdr::{Endian, LinkType, PacketType};
 use nusb::MaybeFuture;
 use nusb::transfer::{Buffer, Bulk, In};
 use tracing::{debug, trace, warn};
-use uhd_core::metadata::{RxError, RxMetadata};
+use uhd_core::metadata::{RxError, RxLoss, RxLossCause, RxMetadata};
 use uhd_core::stream::{RawRxStreamer, StreamArgs, StreamCmd};
 use uhd_core::{Error, Result, SampleFormat, TimeSpec};
 use uhd_transport::RegisterIface;
@@ -187,6 +187,50 @@ struct Packet {
     tsf: Option<u64>,
     sob: bool,
     eob: bool,
+    loss: Option<RxLoss>,
+}
+
+/// Packet-level accounting, independent of USB and of how callers fragment
+/// packets. In particular, overflow flushing must not erase `expected_ticks`.
+#[derive(Debug, Default)]
+struct Continuity {
+    expected_ticks: Option<u64>,
+    pending: Option<RxLossCause>,
+}
+
+impl Continuity {
+    fn note(&mut self, cause: RxLossCause) {
+        self.pending.get_or_insert(cause);
+    }
+
+    fn packet(
+        &mut self,
+        tsf: Option<u64>,
+        nsamps: usize,
+        eob: bool,
+        tick_rate: f64,
+        ticks_per_sample: u64,
+    ) -> Option<RxLoss> {
+        let timestamp_jump = self.expected_ticks.zip(tsf).is_some_and(|(a, b)| a != b);
+        if timestamp_jump {
+            self.note(RxLossCause::TimestampJump);
+        }
+        let loss = self
+            .pending
+            .take()
+            .map(|cause| RxLoss::new(cause, self.expected_ticks, tsf, tick_rate, ticks_per_sample));
+        self.expected_ticks = if eob {
+            // Separate finite bursts have intentional gaps between them.
+            None
+        } else {
+            tsf.and_then(|ticks| {
+                (nsamps as u64)
+                    .checked_mul(ticks_per_sample)
+                    .and_then(|span| ticks.checked_add(span))
+            })
+        };
+        loss
+    }
 }
 
 /// What the next completed transfer turned out to be.
@@ -195,7 +239,7 @@ enum Next {
     /// Samples, in sequence.
     Data(Packet),
     /// Samples, after one or more packets went missing.
-    Gap(Packet),
+    Gap(Packet, RxError),
     /// An inline message from the framer.
     Inline { error: RxError, tsf: Option<u64> },
     /// Something that could not be parsed.
@@ -224,11 +268,12 @@ pub struct B200RxStreamer {
     spp: usize,
     current: Option<Packet>,
     expected_seq: Option<u16>,
-    /// Where the last delivered packet ended, in ticks.
-    next_tsf: Option<u64>,
+    continuity: Continuity,
     /// An event found while filling a buffer that already had samples in it,
     /// held back for the next call.
     queued: Option<RxMetadata>,
+    /// Preserve already copied samples if the following USB operation fails.
+    queued_error: Option<Error>,
 }
 
 /// The frame size UHD would use for a requested one.
@@ -433,8 +478,9 @@ pub(crate) fn open(
         spp: shape.spp,
         current: None,
         expected_seq: None,
-        next_tsf: None,
+        continuity: Continuity::default(),
         queued: None,
+        queued_error: None,
     };
     streamer.scale = streamer.dsp.scaling_adjustment();
     for _ in 0..shape.num_frames {
@@ -505,7 +551,6 @@ impl B200RxStreamer {
             count += 1;
         }
         self.expected_seq = None;
-        self.next_tsf = None;
         count
     }
 
@@ -532,6 +577,7 @@ impl B200RxStreamer {
                 // Put the buffer back so the queue stays its full depth if the
                 // caller decides to carry on.
                 self.ep.submit(completion.buffer);
+                self.continuity.note(RxLossCause::Transport);
                 return Err(Error::Transport(format!(
                     "b2xx rx data transfer failed: {e}"
                 )));
@@ -571,8 +617,7 @@ impl B200RxStreamer {
             if gap {
                 trace!(expected = ?self.expected_seq, got = count, "b2xx rx sequence gap");
             }
-            self.expected_seq = Some((count + 1) & 0xfff);
-            if payload.len() % WIRE_BYTES != 0 {
+            if payload.is_empty() || payload.len() % WIRE_BYTES != 0 {
                 warn!(
                     bytes = payload.len(),
                     "discarding a b2xx rx packet that is not whole sc16 samples"
@@ -580,17 +625,33 @@ impl B200RxStreamer {
                 self.ep.submit(buf);
                 return Ok(Next::Bad);
             }
+            self.expected_seq = Some((count + 1) & 0xfff);
+            if gap {
+                self.continuity.note(RxLossCause::SequenceGap);
+            }
+            let nsamps = payload.len() / WIRE_BYTES;
+            let loss = self.continuity.packet(
+                info.tsf,
+                nsamps,
+                info.eob,
+                self.tick_rate,
+                self.ticks_per_sample,
+            );
+            let timestamp_jump = loss.is_some_and(|l| l.cause == RxLossCause::TimestampJump);
             let packet = Packet {
-                nsamps: payload.len() / WIRE_BYTES,
+                nsamps,
                 payload,
                 offset: 0,
                 tsf: info.tsf,
                 sob: info.sob,
                 eob: info.eob,
+                loss,
                 buf,
             };
             return Ok(if gap {
-                Next::Gap(packet)
+                Next::Gap(packet, RxError::Overflow)
+            } else if timestamp_jump {
+                Next::Gap(packet, RxError::TimestampJump)
             } else {
                 Next::Data(packet)
             });
@@ -647,6 +708,9 @@ impl RawRxStreamer for B200RxStreamer {
             *md = event;
             return Ok(0);
         }
+        if let Some(error) = self.queued_error.take() {
+            return Err(error);
+        }
         let host_bytes = self.host_format.bits_per_sample() / 8;
         let want = out.len() / host_bytes;
         if want == 0 {
@@ -657,7 +721,15 @@ impl RawRxStreamer for B200RxStreamer {
         let mut accum = 0;
         while accum < want {
             if self.current.is_none() {
-                match self.next_packet(deadline)? {
+                let next = match self.next_packet(deadline) {
+                    Ok(next) => next,
+                    Err(error) if accum > 0 => {
+                        self.queued_error = Some(error);
+                        return Ok(accum);
+                    }
+                    Err(error) => return Err(error),
+                };
+                match next {
                     Next::Data(packet) => self.current = Some(packet),
                     Next::Timeout => {
                         if accum == 0 {
@@ -665,13 +737,17 @@ impl RawRxStreamer for B200RxStreamer {
                         }
                         return Ok(accum);
                     }
-                    Next::Gap(packet) => {
+                    Next::Gap(packet, error) => {
                         // Keep the packet that revealed the gap: its samples
                         // are good and are delivered on the next call.
                         let event = RxMetadata {
-                            time_spec: self.next_tsf.or(packet.tsf).map(|t| self.time_of(t)),
-                            out_of_sequence: true,
-                            error: Some(RxError::Overflow),
+                            time_spec: packet
+                                .loss
+                                .and_then(|l| l.expected_ticks)
+                                .or(packet.tsf)
+                                .map(|t| self.time_of(t)),
+                            out_of_sequence: error == RxError::Overflow,
+                            error: Some(error),
                             ..RxMetadata::default()
                         };
                         self.current = Some(packet);
@@ -679,7 +755,12 @@ impl RawRxStreamer for B200RxStreamer {
                     }
                     Next::Inline { error, tsf } => {
                         if error == RxError::Overflow {
-                            self.recover_overflow()?;
+                            self.continuity.note(RxLossCause::Overflow);
+                            if let Err(recovery_error) = self.recover_overflow() {
+                                // Deliver earlier samples and the overflow
+                                // notification before the recovery failure.
+                                self.queued_error = Some(recovery_error);
+                            }
                         }
                         let event = RxMetadata {
                             time_spec: tsf.map(|t| self.time_of(t)),
@@ -689,6 +770,7 @@ impl RawRxStreamer for B200RxStreamer {
                         return Ok(self.report(accum, event, md));
                     }
                     Next::Bad => {
+                        self.continuity.note(RxLossCause::BadPacket);
                         let event = RxMetadata {
                             error: Some(RxError::BadPacket),
                             ..RxMetadata::default()
@@ -711,6 +793,7 @@ impl RawRxStreamer for B200RxStreamer {
                 });
                 md.start_of_burst = packet.sob && packet.offset == 0;
                 md.fragment_offset = packet.offset;
+                md.loss = packet.loss.take();
             }
             let start = packet.payload.start + packet.offset * WIRE_BYTES;
             convert(
@@ -725,9 +808,9 @@ impl RawRxStreamer for B200RxStreamer {
             if packet.offset == packet.nsamps {
                 let eob = packet.eob;
                 if let Some(packet) = self.current.take() {
-                    self.next_tsf = packet
-                        .tsf
-                        .map(|t| t + packet.nsamps as u64 * self.ticks_per_sample);
+                    if eob {
+                        self.expected_seq = None;
+                    }
                     self.ep.submit(packet.buf);
                 }
                 if eob {
@@ -859,6 +942,67 @@ fn bandwidth_warning(rate: f64) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timestamps_detect_loss_even_when_sequence_numbers_match_after_wrap() {
+        let mut continuity = Continuity::default();
+        let base = (1u64 << 54) + 7;
+        assert_eq!(continuity.packet(Some(base), 2040, false, 32e6, 32), None);
+        // A whole 12-bit sequence-counter cycle can disappear without a
+        // sequence mismatch. The timestamp still identifies every sample.
+        let expected = base + 2040 * 32;
+        let resumed = expected + 4096 * 2040 * 32;
+        let loss = continuity
+            .packet(Some(resumed), 2040, false, 32e6, 32)
+            .unwrap();
+        assert_eq!(loss.cause, RxLossCause::TimestampJump);
+        assert_eq!(loss.expected_ticks, Some(expected));
+        assert_eq!(loss.missing_samples, Some(4096 * 2040));
+        assert_eq!(
+            continuity.packet(Some(resumed + 2040 * 32), 3, false, 32e6, 32),
+            None
+        );
+    }
+
+    #[test]
+    fn overflow_and_parse_errors_preserve_the_boundary_until_recovery() {
+        let mut continuity = Continuity::default();
+        continuity.packet(Some(100), 10, false, 1e6, 4);
+        continuity.note(RxLossCause::Overflow);
+        continuity.note(RxLossCause::BadPacket);
+        continuity.note(RxLossCause::SequenceGap);
+        let loss = continuity.packet(Some(180), 5, false, 1e6, 4).unwrap();
+        assert_eq!(loss.cause, RxLossCause::Overflow);
+        assert_eq!(loss.expected_ticks, Some(140));
+        assert_eq!(loss.missing_samples, Some(10));
+        assert_eq!(continuity.packet(Some(200), 5, false, 1e6, 4), None);
+    }
+
+    #[test]
+    fn finite_burst_gaps_are_intentional_but_gaps_within_bursts_are_not() {
+        let mut continuity = Continuity::default();
+        assert_eq!(continuity.packet(Some(100), 10, true, 1e6, 4), None);
+        assert_eq!(continuity.packet(Some(1000), 10, false, 1e6, 4), None);
+        let backwards = continuity.packet(Some(500), 10, false, 1e6, 4).unwrap();
+        assert_eq!(backwards.missing_samples, None);
+        assert_eq!(backwards.duration_secs(), None);
+        assert_eq!(continuity.packet(Some(540), 10, false, 1e6, 4), None);
+    }
+
+    #[test]
+    fn missing_timestamps_and_counter_anomalies_do_not_invent_loss() {
+        let mut continuity = Continuity::default();
+        continuity.note(RxLossCause::SequenceGap);
+        let first = continuity.packet(Some(100), 10, false, 1e6, 4).unwrap();
+        assert_eq!(first.missing_samples, None);
+        continuity.note(RxLossCause::SequenceGap);
+        let zero = continuity.packet(Some(140), 10, false, 1e6, 4).unwrap();
+        assert_eq!(zero.missing_samples, Some(0));
+        continuity.note(RxLossCause::BadPacket);
+        let unknown = continuity.packet(None, 10, false, 1e6, 4).unwrap();
+        assert_eq!(unknown.missing_samples, None);
+        assert_eq!(continuity.packet(Some(1000), 10, false, 1e6, 4), None);
+    }
 
     #[test]
     fn bandwidth_warning_matches_check_bandwidth() {

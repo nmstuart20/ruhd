@@ -79,6 +79,7 @@ fn a_finite_burst_delivers_exactly_n_samples_and_ends_the_burst() {
     loop {
         let (n, md) = recv(&mut rx, &mut buf, Duration::from_secs(1));
         assert_eq!(md.error, None, "after {total} samples: {md:?}");
+        assert_eq!(md.loss, None, "unexpected loss after {total} samples");
         total += n as u64;
         if md.end_of_burst {
             break;
@@ -107,6 +108,7 @@ fn continuous_timestamps_account_for_every_sample() {
     while total < 200_000 {
         let (n, md) = recv(&mut rx, &mut buf, Duration::from_secs(1));
         assert_eq!(md.error, None, "after {total} samples: {md:?}");
+        assert_eq!(md.loss, None, "unexpected loss after {total} samples");
         let ticks = md
             .time_spec
             .expect("b2xx data carries a timestamp")

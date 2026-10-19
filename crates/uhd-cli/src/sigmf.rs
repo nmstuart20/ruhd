@@ -13,8 +13,9 @@
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::rx_stats::LossStats;
 use serde_json::{Map, Value, json};
-use uhd_core::SampleFormat;
+use uhd_core::{RxLoss, RxLossCause, SampleFormat};
 
 /// SigMF specification version the metadata is written against.
 const SIGMF_VERSION: &str = "1.2.0";
@@ -28,14 +29,30 @@ pub(crate) enum EventKind {
     SequenceGap,
     /// A packet could not be parsed and was skipped.
     BadPacket,
+    /// Device time jumped without another preceding error.
+    TimestampJump,
+    /// Reception resumed after a transport failure.
+    Transport,
 }
 
 impl EventKind {
+    pub(crate) fn from_loss(cause: RxLossCause) -> Self {
+        match cause {
+            RxLossCause::Overflow => Self::Overflow,
+            RxLossCause::SequenceGap => Self::SequenceGap,
+            RxLossCause::BadPacket => Self::BadPacket,
+            RxLossCause::TimestampJump => Self::TimestampJump,
+            _ => Self::Transport,
+        }
+    }
+
     fn label(self) -> &'static str {
         match self {
             Self::Overflow => "overflow",
             Self::SequenceGap => "sequence gap",
             Self::BadPacket => "bad packet",
+            Self::TimestampJump => "timestamp jump",
+            Self::Transport => "transport error",
         }
     }
 
@@ -44,6 +61,8 @@ impl EventKind {
             Self::Overflow => "device buffer overflowed; samples were dropped before this point",
             Self::SequenceGap => "packet sequence gap; samples are missing before this point",
             Self::BadPacket => "an unparseable packet was skipped before this point",
+            Self::TimestampJump => "device timestamps were discontinuous before this point",
+            Self::Transport => "reception resumed after a transport error",
         }
     }
 }
@@ -57,6 +76,7 @@ pub(crate) struct Event {
     pub(crate) kind: EventKind,
     /// Device time the stream reported alongside the event, in seconds.
     pub(crate) device_time: Option<f64>,
+    pub(crate) loss: Option<RxLoss>,
 }
 
 /// Everything about a recording that goes into its metadata.
@@ -76,6 +96,7 @@ pub(crate) struct Recording {
     /// Device time of the first sample, in seconds.
     pub(crate) first_device_time: Option<f64>,
     pub(crate) events: Vec<Event>,
+    pub(crate) loss: LossStats,
 }
 
 /// The `.sigmf-meta` path that goes with a data file.
@@ -143,6 +164,16 @@ pub(crate) fn metadata(rec: &Recording) -> Value {
         global.insert("ruhd:bandwidth".into(), json!(bw));
     }
     global.insert("ruhd:discontinuities".into(), json!(rec.events.len()));
+    global.insert("ruhd:loss_episodes".into(), json!(rec.loss.events()));
+    global.insert(
+        "ruhd:known_missing_samples".into(),
+        json!(rec.loss.missing_samples),
+    );
+    global.insert(
+        "ruhd:unknown_loss_episodes".into(),
+        json!(rec.loss.unknown_events()),
+    );
+    global.insert("ruhd:known_gap_seconds".into(), json!(rec.loss.gap_seconds));
 
     let mut capture = Map::new();
     capture.insert("core:sample_start".into(), json!(0));
@@ -162,6 +193,18 @@ pub(crate) fn metadata(rec: &Recording) -> Value {
             a.insert("core:comment".into(), json!(event.kind.comment()));
             if let Some(t) = event.device_time {
                 a.insert("ruhd:device_time".into(), json!(t));
+            }
+            if let Some(loss) = event.loss {
+                a.insert(
+                    "ruhd:loss_cause".into(),
+                    json!(EventKind::from_loss(loss.cause).label()),
+                );
+                a.insert("ruhd:expected_ticks".into(), json!(loss.expected_ticks));
+                a.insert("ruhd:resumed_ticks".into(), json!(loss.resumed_ticks));
+                a.insert("ruhd:tick_rate".into(), json!(loss.tick_rate));
+                a.insert("ruhd:ticks_per_sample".into(), json!(loss.ticks_per_sample));
+                a.insert("ruhd:missing_samples".into(), json!(loss.missing_samples));
+                a.insert("ruhd:gap_seconds".into(), json!(loss.duration_secs()));
             }
             Value::Object(a)
         })
@@ -229,13 +272,16 @@ mod tests {
                     sample: 1000,
                     kind: EventKind::Overflow,
                     device_time: Some(1.501),
+                    loss: None,
                 },
                 Event {
                     sample: 5000,
                     kind: EventKind::SequenceGap,
                     device_time: None,
+                    loss: None,
                 },
             ],
+            loss: LossStats::default(),
         }
     }
 
@@ -281,6 +327,43 @@ mod tests {
             datatype(SampleFormat::Fc64).unwrap(),
             format!("cf64_{suffix}")
         );
+    }
+
+    #[test]
+    fn annotations_preserve_exact_tick_boundaries_and_unknown_counts() {
+        let mut rec = recording();
+        let expected = (1u64 << 54) + 7;
+        let loss = RxLoss::new(
+            RxLossCause::Overflow,
+            Some(expected),
+            Some(expected + 40),
+            32e6,
+            4,
+        );
+        rec.events[0].loss = Some(loss);
+        rec.loss.observe(
+            1,
+            &uhd_core::RxMetadata {
+                loss: Some(loss),
+                ..Default::default()
+            },
+        );
+        let unknown = RxLoss::new(RxLossCause::SequenceGap, None, Some(100), 32e6, 4);
+        rec.events[1].loss = Some(unknown);
+        rec.loss.observe(
+            1,
+            &uhd_core::RxMetadata {
+                loss: Some(unknown),
+                ..Default::default()
+            },
+        );
+        let meta = metadata(&rec);
+        assert_eq!(meta["annotations"][0]["ruhd:expected_ticks"], expected);
+        assert_eq!(meta["annotations"][0]["ruhd:missing_samples"], 10);
+        assert_eq!(meta["annotations"][1]["ruhd:missing_samples"], Value::Null);
+        assert_eq!(meta["global"]["ruhd:known_missing_samples"], 10);
+        assert_eq!(meta["global"]["ruhd:unknown_loss_episodes"], 1);
+        assert_eq!(meta["global"]["ruhd:loss_episodes"], 2);
     }
 
     #[test]

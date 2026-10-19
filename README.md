@@ -39,6 +39,8 @@ permissions, image paths, and troubleshooting.
 
 See [Piping RX to stdout](docs/rx-pipelines.md) for FM listening, live processing,
 compression, and remote capture examples.
+See [RX loss accounting and benchmarks](docs/rx-benchmarks.md) for exact loss
+counts, unknown-loss reporting, receive timing, and JSON benchmark reports.
 
 ## Test
 

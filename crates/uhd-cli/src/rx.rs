@@ -1,7 +1,7 @@
 //! `ruhd rx`: record IQ samples to a file, the rough equivalent of UHD's
 //! `rx_samples_to_file`.
 //!
-//! Beyond what UHD's tool does: Ctrl-C stops the stream cleanly and keeps
+//! Ctrl-C stops the stream cleanly and keeps
 //! what was recorded, the recording gets a SigMF metadata file with every
 //! overflow marked at the sample where it happened, and `--file -` streams to
 //! stdout for piping into other tools.
@@ -23,6 +23,7 @@ use uhd_core::{
     registry,
 };
 
+use crate::rx_stats::LossStats;
 use crate::sigmf::{self, Event, EventKind, Recording};
 
 /// How long the first samples may take to arrive after the stream starts.
@@ -132,6 +133,8 @@ struct Tally {
     overflows: u64,
     gaps: u64,
     bad_packets: u64,
+    time_jumps: u64,
+    loss: LossStats,
     /// Every discontinuity, in the order they happened.
     events: Vec<Event>,
     /// Device time of the first sample, in seconds.
@@ -144,7 +147,7 @@ struct Tally {
 
 impl Tally {
     fn discontinuities(&self) -> u64 {
-        self.overflows + self.gaps + self.bad_packets
+        self.events.len() as u64
     }
 }
 
@@ -291,9 +294,15 @@ pub(crate) fn run(args: &RxArgs) -> Result<()> {
     }
     if tally.discontinuities() > 0 {
         eprintln!(
-            "  {} overflow(s), {} sequence gap(s), {} bad packet(s); the file has \
+            "  {} overflow(s), {} sequence gap(s), {} bad packet(s), {} timestamp jump(s); the file has \
              discontinuities",
-            tally.overflows, tally.gaps, tally.bad_packets
+            tally.overflows, tally.gaps, tally.bad_packets, tally.time_jumps
+        );
+        eprintln!(
+            "  {} known missing samples, {:.9} s known gap duration; {} loss episode(s) with unknown count",
+            tally.loss.missing_samples,
+            tally.loss.gap_seconds,
+            tally.loss.unknown_events()
         );
     }
 
@@ -315,6 +324,7 @@ pub(crate) fn run(args: &RxArgs) -> Result<()> {
             started,
             first_device_time: tally.first_device_time,
             events: std::mem::take(&mut tally.events),
+            loss: tally.loss,
         };
         let text = serde_json::to_string_pretty(&sigmf::metadata(&recording))
             .map_err(|e| Error::Internal(format!("encoding SigMF metadata: {e}")))?;
@@ -478,6 +488,7 @@ fn pump(
             Ok(n) => n,
             Err(e) => break Err(e),
         };
+        tally.loss.observe(n, &md);
         let kind = match md.error {
             None => None,
             Some(RxError::Overflow) if md.out_of_sequence => {
@@ -494,6 +505,10 @@ fn pump(
                 tally.bad_packets += 1;
                 Some(EventKind::BadPacket)
             }
+            Some(RxError::TimestampJump) => {
+                tally.time_jumps += 1;
+                Some(EventKind::TimestampJump)
+            }
             Some(RxError::Timeout) => break Err(Error::Timeout(timeout)),
             Some(other) => {
                 break Err(Error::Device(format!("receive stream error: {other:?}")));
@@ -506,7 +521,28 @@ fn pump(
                 sample: tally.samples,
                 kind,
                 device_time: md.time_spec.map(|t| t.as_secs_f64()),
+                loss: None,
             });
+        }
+        if n > 0
+            && let Some(loss) = md.loss
+        {
+            // The preceding notification(s) and this recovery describe the
+            // same boundary in the output file. Attach accounting once.
+            if let Some(event) = tally
+                .events
+                .last_mut()
+                .filter(|e| e.sample == tally.samples)
+            {
+                event.loss = Some(loss);
+            } else {
+                tally.events.push(Event {
+                    sample: tally.samples,
+                    kind: EventKind::from_loss(loss.cause),
+                    device_time: md.time_spec.map(|t| t.as_secs_f64()),
+                    loss: Some(loss),
+                });
+            }
         }
         if n > 0 && first {
             first = false;
@@ -539,6 +575,7 @@ mod tests {
     use super::*;
     use crate::test_support::ScriptedRx;
     use std::sync::Mutex;
+    use uhd_core::{RxLoss, RxLossCause};
 
     #[derive(Clone, Default)]
     struct Capture {
@@ -556,6 +593,47 @@ mod tests {
             self.flushed.store(true, Ordering::SeqCst);
             Ok(())
         }
+    }
+
+    #[test]
+    fn recovered_loss_updates_the_annotation_without_duplicating_it() {
+        let loss = RxLoss::new(RxLossCause::Overflow, Some(108), Some(148), 1e6, 4);
+        let mut rx = ScriptedRx::new([
+            Ok((vec![1; 8], RxMetadata::default())),
+            Ok((
+                Vec::new(),
+                RxMetadata {
+                    error: Some(RxError::Overflow),
+                    ..Default::default()
+                },
+            )),
+            Ok((
+                vec![2; 8],
+                RxMetadata {
+                    loss: Some(loss),
+                    ..Default::default()
+                },
+            )),
+        ]);
+        let capture = Capture::default();
+        let mut tally = Tally::default();
+        record(
+            &mut rx,
+            Box::new(capture.clone()),
+            Some(4),
+            &AtomicBool::new(false),
+            &mut tally,
+        )
+        .unwrap();
+        assert_eq!(
+            *capture.bytes.lock().unwrap(),
+            [vec![1; 8], vec![2; 8]].concat()
+        );
+        assert_eq!(tally.events.len(), 1);
+        assert_eq!(tally.events[0].sample, 2);
+        assert_eq!(tally.events[0].loss, Some(loss));
+        assert_eq!(tally.loss.missing_samples, 10);
+        assert_eq!(tally.loss.unknown_events(), 0);
     }
 
     #[test]
@@ -629,6 +707,7 @@ mod tests {
                     sample: (BLOCK_BYTES / 4) as u64,
                     kind: EventKind::Overflow,
                     device_time: None,
+                    loss: None,
                 }]
             );
             assert_eq!(

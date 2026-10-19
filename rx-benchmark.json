@@ -1,0 +1,71 @@
+{
+  "completed": true,
+  "configuration": {
+    "actual_rate_sps": 30720000.023935355,
+    "duration_seconds": 60.0,
+    "host_format": "fc32",
+    "master_clock_rate_hz": 30720000.023935355,
+    "num_recv_frames": 128,
+    "random_bursts": false,
+    "requested_rate_sps": 30720000.0,
+    "samples_per_packet": 2040,
+    "samples_per_recv": 2040,
+    "start_delay_seconds": 0.0,
+    "wire_format": "sc16"
+  },
+  "device": "B205mini (3168B41)",
+  "error": null,
+  "host": {
+    "arch": "x86_64",
+    "os": "linux"
+  },
+  "passed": false,
+  "process": {
+    "cpu_percent": 20.97449611482866,
+    "cpu_seconds": 12.584876999999999,
+    "process_peak_rss_bytes": 59576320,
+    "wall_seconds": 60.000854996
+  },
+  "results": {
+    "achieved_percent": 99.88582042355931,
+    "achieved_rate_sps": 30684924.058025446,
+    "bad_packets": 0,
+    "first_samples_after_command_seconds": 0.000087182,
+    "known_gap_seconds": 0.06811647130109401,
+    "known_missing_samples": 2092538,
+    "late_commands": 0,
+    "loss_episodes": 6,
+    "overruns": 6,
+    "received_samples": 1841113176,
+    "recv_timing": {
+      "calls": 902509,
+      "empty_reads": 6,
+      "failed_calls": 0,
+      "max_us": 26681.011,
+      "mean_us": 66.38229142978076,
+      "p50_upper_us": 131.071,
+      "p95_upper_us": 131.071,
+      "p99_upper_us": 131.071,
+      "short_reads": 6
+    },
+    "samples_before_stop": 1841103990,
+    "sequence_errors": 0,
+    "stream_seconds": 60.000278525,
+    "timeouts": 0,
+    "timestamp_jumps": 0,
+    "unknown_loss_episodes": 0,
+    "unresolved_loss": false
+  },
+  "ruhd_version": "0.1.0",
+  "schema_version": 1,
+  "thresholds": {
+    "failures": [
+      "Known missing samples (2092538/0)"
+    ],
+    "known_missing_samples": 0,
+    "overrun": null,
+    "passed": false,
+    "sequence_error": null,
+    "unknown_loss_episodes": 0
+  }
+}

@@ -25,6 +25,7 @@ uhd-transport = { path = "crates/uhd-transport", version = "0.1.0" }
 bytemuck = "1.19"
 clap = { version = "4.5", features = ["derive"] }
 ctrlc = "3.5"
+libc = "0.2"
 num-complex = { version = "0.4.6", features = ["bytemuck"] }
 nusb = "0.2.7"
 thiserror = "2.0"

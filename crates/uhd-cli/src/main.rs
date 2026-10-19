@@ -2,8 +2,10 @@
 //! `uhd_usrp_probe` and `uhd_images_downloader`.
 
 mod benchmark;
+mod benchmark_metrics;
 mod images;
 mod rx;
+mod rx_stats;
 mod sigmf;
 mod tx;
 
@@ -101,9 +103,9 @@ enum Command {
     /// Streams at `--rx-rate` for `--duration` seconds into a buffer that is
     /// thrown away, and prints `benchmark_rate`'s summary: samples received,
     /// overruns, sequence errors, dropped samples, late commands and
-    /// timeouts. Exits non-zero if `--overrun-threshold` or
-    /// `--drop-threshold` is exceeded. Receive only for now. Build with
-    /// `--release`.
+    /// timeouts, plus receive timing and host resource usage. Use `--json`
+    /// to save a report. Exits non-zero when an error threshold is exceeded.
+    /// Receive only for now. Build with `--release`.
     #[command(alias = "benchmark_rate", alias = "benchmark-rate")]
     Benchmark(benchmark::BenchmarkArgs),
     /// Fetch and inspect the UHD images package.
